@@ -29,6 +29,7 @@ namespace PIDAutoTuner
         // 수집 상태
         private double _time;
         private bool _done;
+        private float _lastT = -1f; // 절대시간→dt 변환용
 
         // 수집 데이터
         public readonly List<double> U = new List<double>();
@@ -59,8 +60,9 @@ namespace PIDAutoTuner
 
         /// <summary>
         /// FTD가 매 틱 호출. PID 대신 우리 제어값을 반환.
+        /// 주의: FTD는 두 번째 인자로 절대 시간(time)을 넘김, dt가 아님.
         /// </summary>
-        public State GetControlValue(float processVariable, float dt, out float controlValue)
+        public State GetControlValue(float processVariable, float timeOrDt, out float controlValue)
         {
             if (_done)
             {
@@ -68,7 +70,25 @@ namespace PIDAutoTuner
                 return State.Done;
             }
 
-            _time += dt;
+            // 절대 시간 → dt 변환 (FTD의 TimeToDeltaTime과 같은 로직)
+            float actualDt;
+            if (timeOrDt < 0.5f)
+            {
+                actualDt = timeOrDt; // 이미 dt
+            }
+            else if (_lastT > 0f)
+            {
+                actualDt = timeOrDt - _lastT;
+                _lastT = timeOrDt;
+            }
+            else
+            {
+                _lastT = timeOrDt;
+                controlValue = 0f;
+                return State.Working; // 첫 틱: 기준 시간 설정만
+            }
+
+            _time += actualDt;
 
             // 수집 시간 초과 → 완료
             if (_time > _duration)

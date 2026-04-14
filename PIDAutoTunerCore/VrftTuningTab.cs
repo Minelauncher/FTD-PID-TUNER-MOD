@@ -978,7 +978,7 @@ namespace PIDAutoTuner
             }
 
             // 스텝 진폭: 0.1~0.3 (개루프라 작게, 포화 방지)
-            double amp = Math.Clamp(Math.Max(0.1, natStd * 2.0), 0.1, 0.3);
+            double amp = Math.Clamp(Math.Max(0.02, natStd * 1.0), 0.02, 0.05);
 
             // 최대 10초, y가 정상상태에 도달하면 조기 종료
             _openLoopCollector = new OpenLoopCollector(amp, 10.0);

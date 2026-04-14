@@ -453,10 +453,10 @@ namespace PIDAutoTuner
                         double KuMeasured = 4.0 * h / (Math.PI * a);
                         double Ku = KuMeasured * (double)_sess.OriginalKp;
 
-                        // Ziegler-Nichols PID 규칙
-                        double kp = 0.6 * Ku;
-                        double ti = Tu / 2.0;
-                        double td = Tu / 8.0;
+                        // Tyreus-Luyben PID 규칙 (ZN보다 보수적, 산업 표준)
+                        double kp = 0.45 * Ku;
+                        double ti = 2.2 * Tu;
+                        double td = Tu / 6.3;
 
                         // 클램핑
                         if (ti < 0.1) ti = 0.1;

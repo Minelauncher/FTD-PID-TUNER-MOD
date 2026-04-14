@@ -1162,9 +1162,10 @@ namespace PIDAutoTuner
             }
             _sess.LastMessage = $"Data: u=[{uMin:0.000},{uMax:0.000}] y=[{yMin:0.0},{yMax:0.0}] yStd={yStd:0.000}";
 
-            // τ 추정
-            double tauEst = EstimateDelay(u, y, dt);
-            _s.ModelDelayTau = (float)Math.Clamp(tauEst, 0.0, 0.2);
+            // τ = dt 고정 (FTD 순수 지연 ≈ 1틱)
+            // 폐루프에서 위상 기울기 추정은 PID 위상을 포함해 과대추정하므로 사용하지 않음
+            double tauEst = dt;
+            _s.ModelDelayTau = (float)dt;
 
             // 고정 파라미터
             _s.CutoffHz = (float)(fs / 8.0);
@@ -1674,8 +1675,9 @@ namespace PIDAutoTuner
 
             // ── Ti 결정 ──
             // F=M(1-M)W는 DC에서 0 → aI 추정이 구조적으로 부정확.
-            // VRFT 값이 합리적이면 사용, 아니면 규칙 기반 fallback.
-            double Ti_rule = 4.0 * Math.Max(0.0, s.ModelDelayTau) + Math.Max(0.5, s.SettlingTimeTs);
+            // VRFT 값이 합리적이면 사용, 아니면 IMC 규칙 fallback.
+            // IMC: Ti = 플랜트 시정수 ≈ M의 시정수 × nM = 0.2*Ts*2 = 0.4*Ts
+            double Ti_imc = 0.4 * Math.Max(0.2, s.SettlingTimeTs);
             double Ti_vrft = 250.0;
             if (aI > 1e-12 && Kp > 1e-12) Ti_vrft = Kp / aI;
 
@@ -1683,7 +1685,7 @@ namespace PIDAutoTuner
             if (Ti_vrft > 0.1 && Ti_vrft < 100.0)
                 Ti = Ti_vrft;  // VRFT 추정이 합리적 범위
             else
-                Ti = Ti_rule;  // 규칙 기반 fallback
+                Ti = Ti_imc;   // IMC 규칙 fallback
 
             if (Ti < 0.1) Ti = 0.1;
             if (Ti > 250.0) Ti = 250.0;

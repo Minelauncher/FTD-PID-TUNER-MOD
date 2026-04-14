@@ -178,11 +178,12 @@ namespace PIDAutoTuner
         {
             Idle,       // 대기 중
             Desaturating, // 포화 해소 중 (Kp 자동 감소)
-            Recording,  // 데이터 수집 중
+            Recording,  // 데이터 수집 중 (폐루프)
             Computing,  // 수집 끝, VRFT 계산 중
             Done,       // 계산 완료 (결과 있음)
             Failed,     // 실패 (에러 메시지 있음)
-            Relay       // 릴레이 피드백 초기 튜닝 중
+            Relay,      // 릴레이 피드백 초기 튜닝 중
+            OpenLoop    // 개루프 데이터 수집 중
         }
 
         // ■ sealed class = 상속 불가 클래스. "이 클래스를 더 확장하지 않겠다"는 의미.
@@ -330,6 +331,7 @@ namespace PIDAutoTuner
         private readonly Settings _s = new Settings();
         private readonly Session _sess = new Session();
         private AutoTuneState _autoState = AutoTuneState.Idle;
+        private OpenLoopCollector _openLoopCollector = null;
 
         // 가진 적용 시 원래 SetPoint를 백업해두고, 녹화 끝나면 복원하기 위한 변수.
         // SetPointAdjust = FTD에서 PID의 목표값을 외부에서 조절하는 파라미터.
@@ -386,6 +388,110 @@ namespace PIDAutoTuner
                 {
                     _sess.LastMessage = "focus is null / focus가 null입니다.";
                     StopRecording();
+                    return;
+                }
+
+                // 개루프 수집 상태: DataCollector가 알아서 진행. 완료 체크만.
+                if (_autoState == AutoTuneState.OpenLoop)
+                {
+                    if (_openLoopCollector != null && _openLoopCollector.IsDone())
+                    {
+                        // DataCollector 해제 → PID 복귀
+                        this._focus.DataCollector = null;
+
+                        // 수집된 데이터로 VRFT 계산
+                        try
+                        {
+                            double olDt = Time.fixedDeltaTime;
+                            if (olDt <= 0) olDt = 0.02;
+
+                            int olN = Math.Min(_openLoopCollector.U.Count, _openLoopCollector.Y.Count);
+                            if (olN < _s.MinSamples)
+                            {
+                                _autoState = AutoTuneState.Failed;
+                                _sess.LastMessage = $"Open-loop: insufficient samples {olN}/{_s.MinSamples} / 개루프: 샘플 부족";
+                                return;
+                            }
+
+                            double[] olU = _openLoopCollector.U.ToArray();
+                            double[] olY = _openLoopCollector.Y.ToArray();
+
+                            double olFs = 1.0 / olDt;
+                            _s.ModelDelayTau = (float)olDt;
+                            _s.ModelOrderNm = 2;
+                            _s.CutoffHz = (float)(olFs / 8.0);
+
+                            // Ts 파라미터 안정성 탐색
+                            VrftResult olBestResult = default;
+                            double olBestTs = 1.0;
+                            bool olFound = false;
+
+                            int olTsSteps = 40;
+                            double[] olTsArr = new double[olTsSteps + 1];
+                            double[] olKpArr = new double[olTsSteps + 1];
+                            double[] olTiArr = new double[olTsSteps + 1];
+                            double[] olTdArr = new double[olTsSteps + 1];
+                            bool[] olValid = new bool[olTsSteps + 1];
+                            VrftResult[] olResults = new VrftResult[olTsSteps + 1];
+
+                            for (int si = 0; si <= olTsSteps; si++)
+                            {
+                                olTsArr[si] = 0.1 * Math.Pow(10.0, (double)si / olTsSteps);
+                                _s.SettlingTimeTs = (float)olTsArr[si];
+                                olResults[si] = ComputeVrftPid(olU, olY, olDt, _s);
+                                olKpArr[si] = olResults[si].Kp;
+                                olTiArr[si] = olResults[si].Ti;
+                                olTdArr[si] = olResults[si].Td;
+                                olValid[si] = olResults[si].Kp > 0;
+                            }
+
+                            double olStabThresh = 0.3;
+                            for (int si = 0; si < olTsSteps; si++)
+                            {
+                                if (!olValid[si] || !olValid[si + 1]) continue;
+                                double dKp = Math.Abs(olKpArr[si + 1] - olKpArr[si]) / Math.Max(Math.Abs(olKpArr[si]), 1e-6);
+                                double dTi = Math.Abs(olTiArr[si + 1] - olTiArr[si]) / Math.Max(Math.Abs(olTiArr[si]), 1e-6);
+                                double dTd = Math.Abs(olTdArr[si + 1] - olTdArr[si]) / Math.Max(Math.Abs(olTdArr[si]), 1e-6);
+                                double maxChange = Math.Max(dKp, Math.Max(dTi, dTd));
+                                if (maxChange < olStabThresh)
+                                {
+                                    olBestResult = olResults[si];
+                                    olBestTs = olTsArr[si];
+                                    olFound = true;
+                                    break;
+                                }
+                            }
+
+                            if (!olFound)
+                            {
+                                _s.SettlingTimeTs = 1.0f;
+                                olBestResult = ComputeVrftPid(olU, olY, olDt, _s);
+                                olBestTs = 1.0;
+                            }
+
+                            _s.SettlingTimeTs = (float)olBestTs;
+
+                            _sess.HasResult = true;
+                            _sess.Kp = olBestResult.Kp;
+                            _sess.Ti = olBestResult.Ti;
+                            _sess.Td = olBestResult.Td;
+                            _sess.FitRmse = olBestResult.Rmse;
+
+                            _autoState = AutoTuneState.Done;
+                            _sess.LastMessage = $"Open-loop done | Ts={olBestTs:0.00} N={olN} / 개루프 완료";
+                        }
+                        catch (Exception e)
+                        {
+                            _autoState = AutoTuneState.Failed;
+                            _sess.LastMessage = "Open-loop failed: " + e.Message;
+                        }
+                    }
+                    else
+                    {
+                        // 진행 중 메시지
+                        int olCount = _openLoopCollector != null ? _openLoopCollector.U.Count : 0;
+                        _sess.LastMessage = $"Open-loop collecting: {olCount}/{_s.MinSamples} / 개루프 수집 중";
+                    }
                     return;
                 }
 
@@ -840,6 +946,15 @@ namespace PIDAutoTuner
                 _ => AutoTuneNow()
             ));
 
+            seg.AddInterpretter(new SubjectiveButton<VariableControllerMaster>(
+                this._focus,
+                M.m<VariableControllerMaster>(_ => _autoState == AutoTuneState.OpenLoop ? "Open-loop... / 개루프 중..." : "Open-Loop / 개루프"),
+                M.m<VariableControllerMaster>(new ToolTip(
+                    "Bypass PID and inject test signal directly into the plant.\nProduces cleanest data (no PID influence).\nVehicle will be temporarily uncontrolled!\n---\nPID를 우회하고 테스트 신호를 플랜트에 직접 주입.\n가장 깨끗한 데이터 (PID 영향 없음).\n기체가 일시적으로 무제어 상태!", 260f)),
+                null,
+                _ => OpenLoopTuneNow()
+            ));
+
             seg.AddInterpretter(MakeButton(
                 "Record start/stop / 녹화 시작/중지",
                 "Start/stop sample collection.\nDuring recording, u (output) and y (process variable) are saved every FixedUpdate.\n---\n샘플 수집을 시작/중지합니다.\n" +
@@ -946,6 +1061,53 @@ namespace PIDAutoTuner
                     260f
                 ))
             ));
+        }
+
+        // ============================================================
+        // Open-Loop Tune
+        // ============================================================
+
+        private void OpenLoopTuneNow()
+        {
+            if (_autoState != AutoTuneState.Idle && _autoState != AutoTuneState.Done && _autoState != AutoTuneState.Failed)
+            {
+                _sess.LastMessage = "Tuning already in progress / 튜닝 이미 진행 중";
+                return;
+            }
+
+            double dt = Time.fixedDeltaTime;
+            if (dt <= 0) dt = 0.02;
+
+            // 자연 변동 기반 진폭
+            double natStd = 0;
+            if (_naturalYCount >= 10)
+            {
+                double sum = 0;
+                double sqSum = 0;
+                int n = Math.Min(_naturalYCount, NaturalBufSize);
+                for (int i = 0; i < n; i++)
+                    sum += _naturalYBuf[i];
+                double mean = sum / n;
+                for (int i = 0; i < n; i++)
+                {
+                    double d = _naturalYBuf[i] - mean;
+                    sqSum += d * d;
+                }
+                natStd = Math.Sqrt(sqSum / Math.Max(1, n - 1));
+            }
+
+            // 개루프 진폭: 0.1~0.5 범위 (개루프라 작아도 됨, 포화 방지)
+            double amp = Math.Clamp(Math.Max(0.1, natStd * 2.0), 0.1, 0.5);
+            double duration = _s.MinSamples * dt;
+
+            _openLoopCollector = new OpenLoopCollector(amp, duration, dt, 0.05, 2.0, 12);
+
+            // DataCollector 설정 → PID 우회
+            this._focus.DataCollector = _openLoopCollector;
+
+            _sess.Clear();
+            _autoState = AutoTuneState.OpenLoop;
+            _sess.LastMessage = $"Open-loop started (amp={amp:0.00}, {duration:0.0}s) / 개루프 시작";
         }
 
         // ============================================================

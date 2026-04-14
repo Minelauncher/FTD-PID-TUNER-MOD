@@ -263,6 +263,7 @@ namespace PIDAutoTuner
             public float OriginalTd;             // 릴레이 전 원래 Td
             public int DesatCheckCount;          // 포화 해소 체크 틱 수
             public int DesatSatCount;            // 포화 해소 중 포화 틱 수
+            public int DesatAttempts;            // 포화 해소 시도 횟수 (무한 루프 방지)
 
             // 릴레이 피드백 상태
             public double RelayH;                // 릴레이 출력 크기
@@ -306,6 +307,7 @@ namespace PIDAutoTuner
                 OriginalTd = 0;
                 DesatCheckCount = 0;
                 DesatSatCount = 0;
+                DesatAttempts = 0;
                 RelayH = 0;
                 RelayYCenter = 0;
                 RelayPositive = true;
@@ -530,19 +532,20 @@ namespace PIDAutoTuner
                                 // 포화 충분히 낮음 → 녹화 시작
                                 StartAutoTuneRecording();
                             }
-                            else if (this._focus.Pid.kP.Us > 0.001f)
+                            else if (this._focus.Pid.kP.Us > 0.001f && _sess.DesatAttempts < 10)
                             {
                                 // 포화 높음 → Kp를 절반으로 + 적분 리셋
                                 float newKp = this._focus.Pid.kP.Us * 0.5f;
                                 this._focus.Pid.kP.Us = Math.Max(0.001f, newKp);
                                 this._focus.Pid.SetState(0f, 0f, -1f, 0f);
+                                _sess.DesatAttempts++;
                                 _sess.LastMessage = $"Reducing Kp to {this._focus.Pid.kP.Us:0.000} (sat={satRate:P0}) / Kp를 {this._focus.Pid.kP.Us:0.000}으로 감소 (포화={satRate:P0})";
                                 _sess.DesatCheckCount = 0;
                                 _sess.DesatSatCount = 0;
                             }
                             else
                             {
-                                // Kp를 더 줄일 수 없음 → 그냥 시작
+                                // Kp를 더 줄일 수 없거나 시도 횟수 초과 → 그냥 시작
                                 StartAutoTuneRecording();
                             }
                         }
@@ -680,13 +683,14 @@ namespace PIDAutoTuner
                         _sess.LastMessage = "Auto-tune: analyzing... / 자동 튜닝: 데이터 분석 중...";
                     }
                     // 블록이 3개 이상 쪼개졌으면 → 포화가 반복됨 → Kp 줄이고 적분 리셋 후 재시작
-                    else if (_sess.BlockStarts.Count >= 3 && this._focus.Pid.kP.Us > 0.001f)
+                    else if (_sess.BlockStarts.Count >= 3 && this._focus.Pid.kP.Us > 0.001f && _sess.DesatAttempts < 10)
                     {
                         StopRecording();
                         float newKp = this._focus.Pid.kP.Us * 0.5f;
                         this._focus.Pid.kP.Us = Math.Max(0.001f, newKp);
                         // 적분 누적 리셋
                         this._focus.Pid.SetState(0f, 0f, -1f, 0f);
+                        _sess.DesatAttempts++;
                         _sess.LastMessage = $"Too many blocks. Reducing Kp to {this._focus.Pid.kP.Us:0.000} / 블록 분리 과다. Kp를 {this._focus.Pid.kP.Us:0.000}으로 감소";
                         _sess.Clear();
                         _autoState = AutoTuneState.Desaturating;
@@ -1380,20 +1384,14 @@ namespace PIDAutoTuner
         {
             try
             {
-                if (_sess.U.Count < _s.MinSamples)
-                {
-                    _sess.LastMessage = $"Insufficient samples: {_sess.U.Count}/{_s.MinSamples} / 샘플 부족";
-                    return;
-                }
-
                 double dt = Time.fixedDeltaTime;
                 if (dt <= 0) dt = 0.02;
 
                 // 최장 연속 블록 선택
                 var (blkStart, blkLen) = PickLongestBlock(_sess.BlockStarts, _sess.U.Count, _sess.Y);
-                if (blkLen < 64)
+                if (blkLen < _s.MinSamples)
                 {
-                    _sess.LastMessage = $"Best block only {blkLen} samples / 최장 블록 {blkLen}샘플";
+                    _sess.LastMessage = $"Insufficient: best block {blkLen}/{_s.MinSamples} / 샘플 부족: 최장 블록 {blkLen}/{_s.MinSamples}";
                     return;
                 }
 

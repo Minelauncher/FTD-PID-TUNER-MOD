@@ -388,65 +388,96 @@ namespace PIDAutoTuner
 
                             double uStep = _openLoopCollector.U.Count > 0 ? _openLoopCollector.U[0] : 0.3;
                             double y0 = _openLoopCollector.Y0;
-                            double yFinal = 0;
-                            // 마지막 10%의 평균 = 정상상태
-                            int tailStart = (int)(olN * 0.9);
-                            double tailSum = 0;
-                            for (int i = tailStart; i < olN; i++)
-                                tailSum += _openLoopCollector.Y[i];
-                            yFinal = tailSum / (olN - tailStart);
 
-                            // ── FOPDT 파라미터 추출 ──
-                            // K = (yFinal - y0) / uStep
-                            double K = (yFinal - y0) / Math.Max(1e-6, Math.Abs(uStep));
+                            // ── 1. 정상상태 수렴 판별: FOPDT vs IPDT ──
+                            // 후반 50%의 y 변화율(기울기)로 판단
+                            int halfStart = olN / 2;
+                            double sumT = 0, sumY = 0, sumTY = 0, sumTT = 0;
+                            for (int i = halfStart; i < olN; i++)
+                            {
+                                double t = i * olDt;
+                                double yi = _openLoopCollector.Y[i];
+                                sumT += t;
+                                sumY += yi;
+                                sumTY += t * yi;
+                                sumTT += t * t;
+                            }
+                            int nHalf = olN - halfStart;
+                            double meanT = sumT / nHalf;
+                            double meanY = sumY / nHalf;
+                            // 후반 기울기 (선형 회귀)
+                            double slope = (sumTY - nHalf * meanT * meanY) / Math.Max(1e-12, sumTT - nHalf * meanT * meanT);
+                            double yFinal = meanY; // 후반 평균
 
-                            // τ (순수 지연): y가 y0에서 처음 유의미하게 벗어나는 시간
-                            double yRange = Math.Abs(yFinal - y0);
-                            double threshold5 = y0 + (yFinal - y0) * 0.05; // 5% 반응
-                            double threshold63 = y0 + (yFinal - y0) * 0.632; // 63.2% 반응
+                            // 적분기 판별: 후반 기울기가 유의미하면 IPDT
+                            bool isIntegrator = Math.Abs(slope) > 0.5; // 0.5 단위/초 이상 변화
+
+                            // ── 2. 순수 지연 τ 추정 ──
+                            // y가 y0에서 처음 유의미하게 벗어나는 시간 (5% of 1초 후 변화량)
+                            double yAt1s = (olN > (int)(1.0 / olDt))
+                                ? _openLoopCollector.Y[Math.Min((int)(1.0 / olDt), olN - 1)]
+                                : _openLoopCollector.Y[olN - 1];
+                            double earlyRange = Math.Abs(yAt1s - y0);
+                            double delayThresh = y0 + Math.Sign(yAt1s - y0) * Math.Max(earlyRange * 0.05, 0.01);
                             double tauDelay = 0;
-                            double tauP = olN * olDt; // fallback
-
-                            bool foundDelay = false;
-                            bool foundTau = false;
                             for (int i = 0; i < olN; i++)
                             {
                                 double yi = _openLoopCollector.Y[i];
-                                double tSample = i * olDt;
-
-                                if (!foundDelay)
+                                if ((yAt1s > y0 && yi >= delayThresh) || (yAt1s < y0 && yi <= delayThresh))
                                 {
-                                    // y가 5% 반응에 도달 = 지연 끝
-                                    if ((yFinal > y0 && yi >= threshold5) || (yFinal < y0 && yi <= threshold5))
-                                    {
-                                        tauDelay = tSample;
-                                        foundDelay = true;
-                                    }
-                                }
-                                else if (!foundTau)
-                                {
-                                    // y가 63.2% 반응에 도달 = 시정수
-                                    if ((yFinal > y0 && yi >= threshold63) || (yFinal < y0 && yi <= threshold63))
-                                    {
-                                        tauP = tSample - tauDelay;
-                                        foundTau = true;
-                                    }
+                                    tauDelay = i * olDt;
+                                    break;
                                 }
                             }
-
-                            // 클램핑
                             tauDelay = Math.Max(0, Math.Min(tauDelay, 0.5));
-                            tauP = Math.Max(olDt, tauP);
 
-                            // ── IMC-PID 규칙 ──
-                            // λ = max(τ, 0.1) (튜닝 파라미터)
-                            double lambda = Math.Max(tauDelay, 0.1);
-                            double kp = tauP / (Math.Abs(K) * (tauDelay + lambda));
-                            double ti = tauP;
-                            double td = tauDelay / 2.0;
+                            double kp, ti, td;
+                            string modelType;
 
-                            // K 부호 보정 (역방향 플랜트)
-                            if (K < 0) kp = -kp;
+                            if (isIntegrator)
+                            {
+                                // ── IPDT 모델: P(s) = Kv/s * e^(-τs) ──
+                                // Kv = dy/dt / u (후반 기울기 / 입력)
+                                double Kv = slope / Math.Max(1e-6, Math.Abs(uStep));
+
+                                // IMC-PID for IPDT:
+                                // λ = max(2τ, 0.2)
+                                double lambda = Math.Max(2.0 * tauDelay, 0.2);
+                                kp = 1.0 / (Math.Abs(Kv) * (2.0 * tauDelay + lambda));
+                                ti = 2.0 * (2.0 * tauDelay + lambda);
+                                td = tauDelay;
+
+                                modelType = $"IPDT Kv={Kv:0.000}";
+                            }
+                            else
+                            {
+                                // ── FOPDT 모델: P(s) = K/(1+τp*s) * e^(-τs) ──
+                                double K = (yFinal - y0) / Math.Max(1e-6, Math.Abs(uStep));
+
+                                // 시정수: 63.2% 도달 시간
+                                double threshold63 = y0 + (yFinal - y0) * 0.632;
+                                double tauP = olN * olDt; // fallback
+                                for (int i = 0; i < olN; i++)
+                                {
+                                    double yi = _openLoopCollector.Y[i];
+                                    if ((yFinal > y0 && yi >= threshold63) || (yFinal < y0 && yi <= threshold63))
+                                    {
+                                        tauP = i * olDt - tauDelay;
+                                        break;
+                                    }
+                                }
+                                tauP = Math.Max(olDt, tauP);
+
+                                // IMC-PID for FOPDT:
+                                double lambda = Math.Max(tauDelay, 0.1);
+                                kp = tauP / (Math.Abs(K) * (tauDelay + lambda));
+                                ti = tauP;
+                                td = tauDelay / 2.0;
+
+                                modelType = $"FOPDT K={K:0.000} τp={tauP:0.00}";
+                            }
+
+                            // 부호 보정
                             kp = Math.Abs(kp);
 
                             // 클램핑
@@ -464,7 +495,7 @@ namespace PIDAutoTuner
                             _sess.Ti = ti;
                             _sess.Td = td;
                             _autoState = AutoTuneState.Done;
-                            _sess.LastMessage = $"Step ID: K={K:0.000} τ={tauDelay:0.00} τp={tauP:0.00} y0={y0:0.00} yF={yFinal:0.00} u={uStep:0.00} N={olN} → Kp={kp:0.000} Ti={ti:0.0} Td={td:0.00}";
+                            _sess.LastMessage = $"Step ID ({modelType}) τ={tauDelay:0.00} y0={y0:0.0} slope={slope:0.0} N={olN} → Kp={kp:0.000} Ti={ti:0.0} Td={td:0.00}";
                         }
                         catch (Exception e)
                         {

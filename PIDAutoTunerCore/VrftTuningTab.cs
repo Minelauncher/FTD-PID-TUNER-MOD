@@ -948,16 +948,16 @@ namespace PIDAutoTuner
 
             // 스텝 진폭: 0.1~0.3 (개루프라 작게, 포화 방지)
             double amp = Math.Clamp(Math.Max(0.1, natStd * 2.0), 0.1, 0.3);
-            double duration = 3.0; // 3초 스텝 (FOPDT 식별에 충분)
 
-            _openLoopCollector = new OpenLoopCollector(amp, duration);
+            // 최대 10초, y가 정상상태에 도달하면 조기 종료
+            _openLoopCollector = new OpenLoopCollector(amp, 10.0);
 
             // DataCollector 설정 → PID 우회
             this._focus.DataCollector = _openLoopCollector;
 
             _sess.Clear();
             _autoState = AutoTuneState.OpenLoop;
-            _sess.LastMessage = $"Open-loop started (amp={amp:0.00}, {duration:0.0}s) / 개루프 시작";
+            _sess.LastMessage = $"Step response started (amp={amp:0.00}, max 10s) / 스텝 응답 시작";
         }
 
         // ============================================================

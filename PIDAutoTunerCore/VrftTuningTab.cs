@@ -410,7 +410,7 @@ namespace PIDAutoTuner
                             double yFinal = meanY; // 후반 평균
 
                             // 적분기 판별: 후반 기울기가 유의미하면 IPDT
-                            bool isIntegrator = Math.Abs(slope) > 0.5; // 0.5 단위/초 이상 변화
+                            bool isIntegrator = Math.Abs(slope) > 0.1; // 0.1 단위/초 이상이면 적분기
 
                             // ── 2. 순수 지연 τ 추정 ──
                             // y가 y0에서 처음 유의미하게 벗어나는 시간 (5% of 1초 후 변화량)

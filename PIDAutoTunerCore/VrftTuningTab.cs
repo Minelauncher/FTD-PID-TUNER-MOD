@@ -1053,6 +1053,7 @@ namespace PIDAutoTuner
             _sess.OriginalKp = this._focus.Pid.kP.Us;
             _sess.DesatCheckCount = 0;
             _sess.DesatSatCount = 0;
+            _sess.DesatAttempts = 0;
 
             // 먼저 포화 해소 단계로 진입 (1초간 포화율 측정)
             _autoState = AutoTuneState.Desaturating;

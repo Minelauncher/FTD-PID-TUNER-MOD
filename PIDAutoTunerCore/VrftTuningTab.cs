@@ -464,7 +464,7 @@ namespace PIDAutoTuner
                             _sess.Ti = ti;
                             _sess.Td = td;
                             _autoState = AutoTuneState.Done;
-                            _sess.LastMessage = $"Step ID: K={K:0.000} τ={tauDelay:0.00}s τp={tauP:0.00}s → Kp={kp:0.000} Ti={ti:0.0} Td={td:0.00}";
+                            _sess.LastMessage = $"Step ID: K={K:0.000} τ={tauDelay:0.00} τp={tauP:0.00} y0={y0:0.00} yF={yFinal:0.00} u={uStep:0.00} N={olN} → Kp={kp:0.000} Ti={ti:0.0} Td={td:0.00}";
                         }
                         catch (Exception e)
                         {

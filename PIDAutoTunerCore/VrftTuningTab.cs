@@ -1164,7 +1164,7 @@ namespace PIDAutoTuner
 
             // τ 추정
             double tauEst = EstimateDelay(u, y, dt);
-            _s.ModelDelayTau = (float)Math.Clamp(tauEst, 0.0, 5.0);
+            _s.ModelDelayTau = (float)Math.Clamp(tauEst, 0.0, 0.2);
 
             // 고정 파라미터
             _s.CutoffHz = (float)(fs / 8.0);
@@ -2018,7 +2018,7 @@ namespace PIDAutoTuner
 
             // τ = -slope (위상 기울기가 음수면 양의 지연)
             double tau = -slope;
-            return Math.Max(0.0, Math.Min(tau, 1.0)); // FTD 환경: 최대 1초로 제한
+            return Math.Max(0.0, Math.Min(tau, 0.2)); // FTD 환경: 순수 지연 최대 0.2초 (10틱)
         }
 
         private static double EstimateSettlingTime(double[] y, double dt)

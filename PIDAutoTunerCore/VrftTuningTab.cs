@@ -182,8 +182,7 @@ namespace PIDAutoTuner
             Computing,  // 수집 끝, VRFT 계산 중
             Done,       // 계산 완료 (결과 있음)
             Failed,     // 실패 (에러 메시지 있음)
-            Relay,      // 릴레이 피드백 초기 튜닝 중
-            OpenLoop    // 개루프 데이터 수집 중
+            OpenLoop    // 개루프 스텝 응답 수집 중
         }
 
         // ■ sealed class = 상속 불가 클래스. "이 클래스를 더 확장하지 않겠다"는 의미.
@@ -260,22 +259,9 @@ namespace PIDAutoTuner
             public double LastU;                 // 마지막 제어 출력 (포화 회피용)
             public double NaturalYStd;           // 가진 전 자연 변동 (y의 std)
             public float OriginalKp;             // 포화 해소 전 원래 Kp
-            public float OriginalTi;             // 릴레이 전 원래 Ti
-            public float OriginalTd;             // 릴레이 전 원래 Td
             public int DesatCheckCount;          // 포화 해소 체크 틱 수
             public int DesatSatCount;            // 포화 해소 중 포화 틱 수
             public int DesatAttempts;            // 포화 해소 시도 횟수 (무한 루프 방지)
-
-            // 릴레이 피드백 상태
-            public double RelayH;                // 릴레이 출력 크기
-            public double RelayYCenter;          // y 중심값 (릴레이 전환 기준)
-            public bool RelayPositive;           // 현재 릴레이 방향
-            public int RelayCrossCount;          // y 중심 교차 횟수
-            public double RelayLastCrossT;       // 마지막 교차 시각
-            public double RelayPeriodSum;        // 주기 합 (평균용)
-            public double RelayYMax;             // y 최대값 (진폭 계산)
-            public double RelayYMin;             // y 최소값 (진폭 계산)
-            public double RelayT;                // 릴레이 경과 시간
 
             public bool HasResult;
             public double Kp, Ti, Td;
@@ -304,20 +290,9 @@ namespace PIDAutoTuner
                 LastU = 0;
                 NaturalYStd = 0;
                 OriginalKp = 0;
-                OriginalTi = 0;
-                OriginalTd = 0;
                 DesatCheckCount = 0;
                 DesatSatCount = 0;
                 DesatAttempts = 0;
-                RelayH = 0;
-                RelayYCenter = 0;
-                RelayPositive = true;
-                RelayCrossCount = 0;
-                RelayLastCrossT = 0;
-                RelayPeriodSum = 0;
-                RelayYMax = double.MinValue;
-                RelayYMin = double.MaxValue;
-                RelayT = 0;
                 HasResult = false;
                 Kp = Ti = Td = FitRmse = 0;
                 LastMessage = "";
@@ -391,94 +366,105 @@ namespace PIDAutoTuner
                     return;
                 }
 
-                // 개루프 수집 상태: DataCollector가 알아서 진행. 완료 체크만.
+                // 개루프 스텝 응답 수집 → FOPDT 식별 → IMC-PID 산출
                 if (_autoState == AutoTuneState.OpenLoop)
                 {
                     if (_openLoopCollector != null && _openLoopCollector.IsDone())
                     {
-                        // DataCollector 해제 → PID 복귀
-                        this._focus.DataCollector = null;
+                        this._focus.DataCollector = null; // PID 복귀
 
-                        // 수집된 데이터로 VRFT 계산
                         try
                         {
                             double olDt = Time.fixedDeltaTime;
                             if (olDt <= 0) olDt = 0.02;
 
-                            int olN = Math.Min(_openLoopCollector.U.Count, _openLoopCollector.Y.Count);
-                            if (olN < _s.MinSamples)
+                            int olN = _openLoopCollector.Y.Count;
+                            if (olN < 20)
                             {
                                 _autoState = AutoTuneState.Failed;
-                                _sess.LastMessage = $"Open-loop: insufficient samples {olN}/{_s.MinSamples} / 개루프: 샘플 부족";
+                                _sess.LastMessage = "Open-loop: insufficient data / 개루프: 데이터 부족";
                                 return;
                             }
 
-                            double[] olU = _openLoopCollector.U.ToArray();
-                            double[] olY = _openLoopCollector.Y.ToArray();
+                            double uStep = _openLoopCollector.U.Count > 0 ? _openLoopCollector.U[0] : 0.3;
+                            double y0 = _openLoopCollector.Y0;
+                            double yFinal = 0;
+                            // 마지막 10%의 평균 = 정상상태
+                            int tailStart = (int)(olN * 0.9);
+                            double tailSum = 0;
+                            for (int i = tailStart; i < olN; i++)
+                                tailSum += _openLoopCollector.Y[i];
+                            yFinal = tailSum / (olN - tailStart);
 
-                            double olFs = 1.0 / olDt;
-                            _s.ModelDelayTau = (float)olDt;
-                            _s.ModelOrderNm = 2;
-                            _s.CutoffHz = (float)(olFs / 8.0);
+                            // ── FOPDT 파라미터 추출 ──
+                            // K = (yFinal - y0) / uStep
+                            double K = (yFinal - y0) / Math.Max(1e-6, Math.Abs(uStep));
 
-                            // Ts 파라미터 안정성 탐색
-                            VrftResult olBestResult = default;
-                            double olBestTs = 1.0;
-                            bool olFound = false;
+                            // τ (순수 지연): y가 y0에서 처음 유의미하게 벗어나는 시간
+                            double yRange = Math.Abs(yFinal - y0);
+                            double threshold5 = y0 + (yFinal - y0) * 0.05; // 5% 반응
+                            double threshold63 = y0 + (yFinal - y0) * 0.632; // 63.2% 반응
+                            double tauDelay = 0;
+                            double tauP = olN * olDt; // fallback
 
-                            int olTsSteps = 40;
-                            double[] olTsArr = new double[olTsSteps + 1];
-                            double[] olKpArr = new double[olTsSteps + 1];
-                            double[] olTiArr = new double[olTsSteps + 1];
-                            double[] olTdArr = new double[olTsSteps + 1];
-                            bool[] olValid = new bool[olTsSteps + 1];
-                            VrftResult[] olResults = new VrftResult[olTsSteps + 1];
-
-                            for (int si = 0; si <= olTsSteps; si++)
+                            bool foundDelay = false;
+                            bool foundTau = false;
+                            for (int i = 0; i < olN; i++)
                             {
-                                olTsArr[si] = 0.1 * Math.Pow(10.0, (double)si / olTsSteps);
-                                _s.SettlingTimeTs = (float)olTsArr[si];
-                                olResults[si] = ComputeVrftPid(olU, olY, olDt, _s);
-                                olKpArr[si] = olResults[si].Kp;
-                                olTiArr[si] = olResults[si].Ti;
-                                olTdArr[si] = olResults[si].Td;
-                                olValid[si] = olResults[si].Kp > 0;
-                            }
+                                double yi = _openLoopCollector.Y[i];
+                                double tSample = i * olDt;
 
-                            double olStabThresh = 0.3;
-                            for (int si = 0; si < olTsSteps; si++)
-                            {
-                                if (!olValid[si] || !olValid[si + 1]) continue;
-                                double dKp = Math.Abs(olKpArr[si + 1] - olKpArr[si]) / Math.Max(Math.Abs(olKpArr[si]), 1e-6);
-                                double dTi = Math.Abs(olTiArr[si + 1] - olTiArr[si]) / Math.Max(Math.Abs(olTiArr[si]), 1e-6);
-                                double dTd = Math.Abs(olTdArr[si + 1] - olTdArr[si]) / Math.Max(Math.Abs(olTdArr[si]), 1e-6);
-                                double maxChange = Math.Max(dKp, Math.Max(dTi, dTd));
-                                if (maxChange < olStabThresh)
+                                if (!foundDelay)
                                 {
-                                    olBestResult = olResults[si];
-                                    olBestTs = olTsArr[si];
-                                    olFound = true;
-                                    break;
+                                    // y가 5% 반응에 도달 = 지연 끝
+                                    if ((yFinal > y0 && yi >= threshold5) || (yFinal < y0 && yi <= threshold5))
+                                    {
+                                        tauDelay = tSample;
+                                        foundDelay = true;
+                                    }
+                                }
+                                else if (!foundTau)
+                                {
+                                    // y가 63.2% 반응에 도달 = 시정수
+                                    if ((yFinal > y0 && yi >= threshold63) || (yFinal < y0 && yi <= threshold63))
+                                    {
+                                        tauP = tSample - tauDelay;
+                                        foundTau = true;
+                                    }
                                 }
                             }
 
-                            if (!olFound)
-                            {
-                                _s.SettlingTimeTs = 1.0f;
-                                olBestResult = ComputeVrftPid(olU, olY, olDt, _s);
-                                olBestTs = 1.0;
-                            }
+                            // 클램핑
+                            tauDelay = Math.Max(0, Math.Min(tauDelay, 0.5));
+                            tauP = Math.Max(olDt, tauP);
 
-                            _s.SettlingTimeTs = (float)olBestTs;
+                            // ── IMC-PID 규칙 ──
+                            // λ = max(τ, 0.1) (튜닝 파라미터)
+                            double lambda = Math.Max(tauDelay, 0.1);
+                            double kp = tauP / (Math.Abs(K) * (tauDelay + lambda));
+                            double ti = tauP;
+                            double td = tauDelay / 2.0;
+
+                            // K 부호 보정 (역방향 플랜트)
+                            if (K < 0) kp = -kp;
+                            kp = Math.Abs(kp);
+
+                            // 클램핑
+                            kp = Math.Max(0.001, Math.Min(1.0, kp));
+                            ti = Math.Max(0.1, Math.Min(250.0, ti));
+                            td = Math.Max(0.0, Math.Min(10.0, td));
+
+                            // PID 적용
+                            this._focus.Pid.kP.Us = (float)kp;
+                            this._focus.Pid.kI.Us = (float)ti;
+                            this._focus.Pid.kD.Us = (float)td;
 
                             _sess.HasResult = true;
-                            _sess.Kp = olBestResult.Kp;
-                            _sess.Ti = olBestResult.Ti;
-                            _sess.Td = olBestResult.Td;
-                            _sess.FitRmse = olBestResult.Rmse;
-
+                            _sess.Kp = kp;
+                            _sess.Ti = ti;
+                            _sess.Td = td;
                             _autoState = AutoTuneState.Done;
-                            _sess.LastMessage = $"Open-loop done | Ts={olBestTs:0.00} N={olN} / 개루프 완료";
+                            _sess.LastMessage = $"Step ID: K={K:0.000} τ={tauDelay:0.00}s τp={tauP:0.00}s → Kp={kp:0.000} Ti={ti:0.0} Td={td:0.00}";
                         }
                         catch (Exception e)
                         {
@@ -488,132 +474,8 @@ namespace PIDAutoTuner
                     }
                     else
                     {
-                        // 진행 중 메시지
                         int olCount = _openLoopCollector != null ? _openLoopCollector.U.Count : 0;
-                        _sess.LastMessage = $"Open-loop collecting: {olCount}/{_s.MinSamples} / 개루프 수집 중";
-                    }
-                    return;
-                }
-
-                // 릴레이 피드백 상태: ON/OFF 릴레이로 진동 유도 → Ku, Tu 측정 → ZN PID 산출
-                if (_autoState == AutoTuneState.Relay)
-                {
-                    double rdt = Time.fixedDeltaTime;
-                    if (rdt <= 0) rdt = 0.02;
-                    _sess.RelayT += rdt;
-
-                    IVariableController cRelay = this._focus.GetCurrentController();
-                    if (cRelay == null) return;
-
-                    double ry = cRelay.LastProcessVariable;
-                    double h = _sess.RelayH;
-
-                    // y가 중심을 교차하면 릴레이 방향 전환
-                    bool above = ry > _sess.RelayYCenter;
-                    if (above && !_sess.RelayPositive)
-                    {
-                        // 아래→위 교차
-                        _sess.RelayPositive = true;
-                        if (_sess.RelayCrossCount > 0)
-                        {
-                            double period = (_sess.RelayT - _sess.RelayLastCrossT) * 2.0;
-                            _sess.RelayPeriodSum += period;
-                        }
-                        _sess.RelayCrossCount++;
-                        _sess.RelayLastCrossT = _sess.RelayT;
-                    }
-                    else if (!above && _sess.RelayPositive)
-                    {
-                        // 위→아래 교차
-                        _sess.RelayPositive = false;
-                        if (_sess.RelayCrossCount > 0)
-                        {
-                            double period = (_sess.RelayT - _sess.RelayLastCrossT) * 2.0;
-                            _sess.RelayPeriodSum += period;
-                        }
-                        _sess.RelayCrossCount++;
-                        _sess.RelayLastCrossT = _sess.RelayT;
-                    }
-
-                    // y 최대/최소 추적 (진폭 계산용)
-                    if (ry > _sess.RelayYMax) _sess.RelayYMax = ry;
-                    if (ry < _sess.RelayYMin) _sess.RelayYMin = ry;
-
-                    // 릴레이 출력 적용 (PID 우회: SetPointAdjust로 큰 편향을 줘서 릴레이 효과)
-                    double relayOutput = _sess.RelayPositive ? h : -h;
-                    try
-                    {
-                        this._focus.SetPointAdjust.Us = _baseSetPointAdjust + (float)relayOutput;
-                    }
-                    catch { }
-
-                    // 충분한 교차 후 결과 산출 (최소 6회 교차 = 3주기)
-                    if (_sess.RelayCrossCount >= 6 && _sess.RelayT > 3.0)
-                    {
-                        // 평균 주기
-                        double Tu = _sess.RelayPeriodSum / Math.Max(1, _sess.RelayCrossCount - 1);
-                        // 진폭
-                        double a = (_sess.RelayYMax - _sess.RelayYMin) / 2.0;
-                        if (a < 1e-6) a = 1e-6;
-                        // 임계 게인 (측정값은 Kp*Plant의 Ku → Plant의 Ku로 보정)
-                        double KuMeasured = 4.0 * h / (Math.PI * a);
-                        double Ku = KuMeasured * (double)_sess.OriginalKp;
-
-                        // Tyreus-Luyben PID 규칙 (ZN보다 보수적, 산업 표준)
-                        double kp = 0.45 * Ku;
-                        double ti = 2.2 * Tu;
-                        double td = Tu / 6.3;
-
-                        // 클램핑
-                        if (ti < 0.1) ti = 0.1;
-                        if (ti > 250.0) ti = 250.0;
-                        if (td < 0.0) td = 0.0;
-                        if (td > 10.0) td = 10.0;
-                        if (kp < 0.001) kp = 0.001;
-                        if (kp > 1.0) kp = 1.0;
-
-                        // PID 적용
-                        this._focus.Pid.kP.Us = (float)kp;
-                        this._focus.Pid.kI.Us = (float)ti;
-                        this._focus.Pid.kD.Us = (float)td;
-
-                        // SP 복원
-                        RestoreSetPointAdjustIfNeeded();
-
-                        _sess.HasResult = true;
-                        _sess.Kp = kp;
-                        _sess.Ti = ti;
-                        _sess.Td = td;
-                        _autoState = AutoTuneState.Done;
-                        _sess.LastMessage = $"Relay done: Ku={Ku:0.000} Tu={Tu:0.00}s → Kp={kp:0.000} Ti={ti:0.0} Td={td:0.00}";
-                    }
-                    // 5초마다 교차 부족 체크 → 릴레이 크기 증가
-                    else if (_sess.RelayT > 5.0 && _sess.RelayCrossCount < 2
-                          && _sess.RelayH < 10.0
-                          && ((int)(_sess.RelayT / 5.0)) > ((int)((_sess.RelayT - rdt) / 5.0)))
-                    {
-                        _sess.RelayH *= 2.0;
-                        if (_sess.RelayH > 10.0) _sess.RelayH = 10.0;
-                        // y 중심값 갱신
-                        _sess.RelayYCenter = ry;
-                        _sess.RelayYMax = double.MinValue;
-                        _sess.RelayYMin = double.MaxValue;
-                        _sess.LastMessage = $"Relay: increasing amplitude to {_sess.RelayH:0.0} / 릴레이: 진폭을 {_sess.RelayH:0.0}으로 증가";
-                    }
-                    // 타임아웃 (30초)
-                    else if (_sess.RelayT > 30.0)
-                    {
-                        RestoreSetPointAdjustIfNeeded();
-                        // 원래 PID 복원 (I, D를 끄고 있었으므로)
-                        this._focus.Pid.kP.Us = _sess.OriginalKp;
-                        this._focus.Pid.kI.Us = _sess.OriginalTi;
-                        this._focus.Pid.kD.Us = _sess.OriginalTd;
-                        _autoState = AutoTuneState.Failed;
-                        _sess.LastMessage = "Relay timeout. PID may already be stable — try Auto Tune directly. / 릴레이 타임아웃. PID가 이미 안정적일 수 있습니다 — Auto Tune을 바로 시도하세요.";
-                    }
-                    else
-                    {
-                        _sess.LastMessage = $"Relay: crossings={_sess.RelayCrossCount}/6 h={_sess.RelayH:0.0} t={_sess.RelayT:0.0}s / 릴레이: 교차={_sess.RelayCrossCount}/6 h={_sess.RelayH:0.0}";
+                        _sess.LastMessage = $"Step response: {olCount} samples / 스텝 응답 수집 중";
                     }
                     return;
                 }
@@ -930,29 +792,20 @@ namespace PIDAutoTuner
 
             seg.AddInterpretter(new SubjectiveButton<VariableControllerMaster>(
                 this._focus,
-                M.m<VariableControllerMaster>(_ => _autoState == AutoTuneState.Relay ? "Relay... / 릴레이 중..." : "Relay Init / 릴레이 초기화"),
+                M.m<VariableControllerMaster>(_ => _autoState == AutoTuneState.OpenLoop ? "Step ID... / 스텝 식별 중..." : "Step ID / 스텝 식별"),
                 M.m<VariableControllerMaster>(new ToolTip(
-                    "Find initial PID via relay feedback (Åström-Hägglund).\nUse when PID is completely wrong or unknown.\nThe vehicle will oscillate briefly.\n---\n릴레이 피드백으로 초기 PID를 찾습니다.\nPID가 완전히 틀리거나 모를 때 사용.\n기체가 잠시 진동합니다.", 260f)),
+                    "Open-loop step response → FOPDT model → IMC-PID.\n~3s open-loop test. Use when PID is unknown or bad.\nVehicle briefly uncontrolled!\n---\n개루프 스텝 응답 → FOPDT 모델 → IMC-PID.\n~3초 개루프 테스트. PID를 모르거나 나쁠 때 사용.\n기체가 잠시 무제어!", 260f)),
                 null,
-                _ => RelayTuneNow()
+                _ => OpenLoopTuneNow()
             ));
 
             seg.AddInterpretter(new SubjectiveButton<VariableControllerMaster>(
                 this._focus,
                 M.m<VariableControllerMaster>(_ => _autoState == AutoTuneState.Recording ? "Auto-tuning... / 자동 튜닝 중..." : "Auto Tune / 자동 튜닝"),
                 M.m<VariableControllerMaster>(new ToolTip(
-                    "One click: set excitation → record → estimate τ/Ts → VRFT compute.\nRequires a reasonably stable PID first (use Relay Init if needed).\n---\n버튼 한 번으로 자극 설정 → 녹화 → VRFT 계산까지 자동 수행.\n먼저 적당한 PID가 필요합니다 (필요 시 릴레이 초기화 사용).", 260f)),
+                    "Closed-loop VRFT: excitation → record → compute.\nRequires a reasonably stable PID first (use Step ID if needed).\n---\n폐루프 VRFT: 가진 → 녹화 → 계산.\n먼저 적당한 PID가 필요 (필요 시 스텝 식별 사용).", 260f)),
                 null,
                 _ => AutoTuneNow()
-            ));
-
-            seg.AddInterpretter(new SubjectiveButton<VariableControllerMaster>(
-                this._focus,
-                M.m<VariableControllerMaster>(_ => _autoState == AutoTuneState.OpenLoop ? "Open-loop... / 개루프 중..." : "Open-Loop / 개루프"),
-                M.m<VariableControllerMaster>(new ToolTip(
-                    "Bypass PID and inject test signal directly into the plant.\nProduces cleanest data (no PID influence).\nVehicle will be temporarily uncontrolled!\n---\nPID를 우회하고 테스트 신호를 플랜트에 직접 주입.\n가장 깨끗한 데이터 (PID 영향 없음).\n기체가 일시적으로 무제어 상태!", 260f)),
-                null,
-                _ => OpenLoopTuneNow()
             ));
 
             seg.AddInterpretter(MakeButton(
@@ -1075,9 +928,6 @@ namespace PIDAutoTuner
                 return;
             }
 
-            double dt = Time.fixedDeltaTime;
-            if (dt <= 0) dt = 0.02;
-
             // 자연 변동 기반 진폭
             double natStd = 0;
             if (_naturalYCount >= 10)
@@ -1096,11 +946,11 @@ namespace PIDAutoTuner
                 natStd = Math.Sqrt(sqSum / Math.Max(1, n - 1));
             }
 
-            // 개루프 진폭: 0.1~0.5 범위 (개루프라 작아도 됨, 포화 방지)
-            double amp = Math.Clamp(Math.Max(0.1, natStd * 2.0), 0.1, 0.5);
-            double duration = _s.MinSamples * dt;
+            // 스텝 진폭: 0.1~0.3 (개루프라 작게, 포화 방지)
+            double amp = Math.Clamp(Math.Max(0.1, natStd * 2.0), 0.1, 0.3);
+            double duration = 3.0; // 3초 스텝 (FOPDT 식별에 충분)
 
-            _openLoopCollector = new OpenLoopCollector(amp, duration, dt, 0.05, 2.0, 12);
+            _openLoopCollector = new OpenLoopCollector(amp, duration);
 
             // DataCollector 설정 → PID 우회
             this._focus.DataCollector = _openLoopCollector;
@@ -1130,66 +980,6 @@ namespace PIDAutoTuner
             if (_autoState == AutoTuneState.Recording)
                 _autoState = AutoTuneState.Idle;
             _sess.LastMessage = "Recording stopped / 녹화 중지";
-        }
-
-        // ============================================================
-        // Relay Feedback (Initial PID)
-        // ============================================================
-
-        private void RelayTuneNow()
-        {
-            if (_autoState != AutoTuneState.Idle && _autoState != AutoTuneState.Done && _autoState != AutoTuneState.Failed)
-            {
-                _sess.LastMessage = "Tuning already in progress / 튜닝 이미 진행 중";
-                return;
-            }
-
-            // 원래 PID 백업 (복원용)
-            _sess.OriginalKp = this._focus.Pid.kP.Us;
-            _sess.OriginalTi = this._focus.Pid.kI.Us;
-            _sess.OriginalTd = this._focus.Pid.kD.Us;
-
-            // I, D를 끄고 P만 유지 — 릴레이가 보는 것이 Kp*Plant이 되도록
-            this._focus.Pid.kI.Us = 250f; // Ti=250 = 적분 off
-            this._focus.Pid.kD.Us = 0f;   // Td=0 = 미분 off
-            this._focus.Pid.SetState(0f, 0f, -1f, 0f); // 적분 상태 리셋
-
-            CaptureSetPointAdjustBase();
-
-            // 릴레이 초기화
-            IVariableController c = this._focus.GetCurrentController();
-            double yNow = c != null ? c.LastProcessVariable : 0;
-
-            _sess.Clear();
-            // 릴레이 크기: 자연 변동의 3배 이상, 최소 2.0
-            double relayNatStd = 0;
-            if (_naturalYCount >= 10)
-            {
-                double sum = 0;
-                double sqSum = 0;
-                int n = Math.Min(_naturalYCount, NaturalBufSize);
-                for (int i = 0; i < n; i++)
-                    sum += _naturalYBuf[i];
-                double mean = sum / n;
-                for (int i = 0; i < n; i++)
-                {
-                    double d = _naturalYBuf[i] - mean;
-                    sqSum += d * d;
-                }
-                relayNatStd = Math.Sqrt(sqSum / Math.Max(1, n - 1));
-            }
-            _sess.RelayH = Math.Clamp(Math.Max(2.0, relayNatStd * 3.0), 2.0, _s.AdaptiveAmpMax);
-            _sess.RelayYCenter = yNow;
-            _sess.RelayPositive = true;
-            _sess.RelayCrossCount = 0;
-            _sess.RelayLastCrossT = 0;
-            _sess.RelayPeriodSum = 0;
-            _sess.RelayYMax = double.MinValue;
-            _sess.RelayYMin = double.MaxValue;
-            _sess.RelayT = 0;
-
-            _autoState = AutoTuneState.Relay;
-            _sess.LastMessage = "Relay feedback started / 릴레이 피드백 시작";
         }
 
         // ============================================================

@@ -304,7 +304,6 @@ namespace PIDAutoTuner
         private readonly Session _sess = new Session();
         private AutoTuneState _autoState = AutoTuneState.Idle;
         private OpenLoopCollector _openLoopCollector = null;
-        private PidPlusExciteCollector _pidExciteCollector = null;
 
         // 다른 축 Controller (MISO N4SID용 커플링 분석)
         private readonly List<VariableControllerMaster> _otherAxes = new List<VariableControllerMaster>();
@@ -555,39 +554,6 @@ namespace PIDAutoTuner
                 double dt = Time.fixedDeltaTime;
                 if (dt <= 0) dt = 0.02;
 
-                // PidPlusExciteCollector 모드: collector가 데이터 자동 수집, 완료 체크만
-                if (_pidExciteCollector != null && _autoState == AutoTuneState.Recording)
-                {
-                    int colN = _pidExciteCollector.U.Count;
-                    if (colN >= _s.MinSamples || _pidExciteCollector.IsDone())
-                    {
-                        // 수집 완료 → DataCollector 해제 → AutoTuneCompute로 이동
-                        this._focus.DataCollector = null;
-
-                        // collector 데이터를 _sess에 복사 (AutoTuneCompute가 사용)
-                        _sess.U.Clear();
-                        _sess.Y.Clear();
-                        _sess.BlockStarts.Clear();
-                        _sess.BlockStarts.Add(0);
-                        for (int i = 0; i < colN; i++)
-                        {
-                            _sess.U.Add(_pidExciteCollector.U[i]);
-                            _sess.Y.Add(_pidExciteCollector.Y[i]);
-                        }
-
-                        _pidExciteCollector = null; // cleanup: 재진입 방지, 메모리 해제
-                        _sess.Recording = false;
-                        _autoState = AutoTuneState.Computing;
-                        _sess.LastMessage = $"Recording done ({colN} samples), analyzing... / 녹화 완료, 분석 중...";
-                    }
-                    else
-                    {
-                        if (colN % 60 == 0)
-                            _sess.LastMessage = $"PID+excite: {colN}/{_s.MinSamples} samples";
-                    }
-                    return;
-                }
-
                 ApplyExcitation((float)dt);
 
                 IVariableController c = this._focus.GetCurrentController();
@@ -728,9 +694,7 @@ namespace PIDAutoTuner
                 M.m<VariableControllerMaster>(_ =>
                 {
                     string rec;
-                    if (_pidExciteCollector != null && _autoState == AutoTuneState.Recording)
-                        rec = "PID+excite / PID+가진";
-                    else if (_autoState == AutoTuneState.Computing)
+                    if (_autoState == AutoTuneState.Computing)
                         rec = "Computing / 계산 중";
                     else if (_sess.Recording)
                         rec = "Recording / 녹화중";
@@ -744,11 +708,8 @@ namespace PIDAutoTuner
                         rec = "Idle / 대기";
                     double dt = Time.fixedDeltaTime;
 
-                    // 진행 카운트: 활성 컬렉터 → _sess 순서로 확인
                     int progressCount = 0;
-                    if (_pidExciteCollector != null)
-                        progressCount = _pidExciteCollector.U.Count;
-                    else if (_openLoopCollector != null)
+                    if (_openLoopCollector != null)
                         progressCount = _openLoopCollector.U.Count;
                     else
                     {
@@ -1036,7 +997,6 @@ namespace PIDAutoTuner
 
             // DataCollector 및 컬렉터 정리 (안전)
             try { if (this._focus != null) this._focus.DataCollector = null; } catch { }
-            _pidExciteCollector = null;
             _openLoopCollector = null;
 
             if (_autoState == AutoTuneState.Recording)
@@ -1095,35 +1055,22 @@ namespace PIDAutoTuner
             }
             _sess.NaturalYStd = naturalStd;
 
-            // 시작 진폭: 자연 변동의 3배 이상, 최소 0.1 (u에 직접 더하므로 작게)
-            double startAmp = Math.Max(0.1, naturalStd * 0.05);
-            startAmp = Math.Min(startAmp, 0.3); // u 직접 가진은 0.3 상한
+            // 시작 진폭: 자연 변동의 3배 이상, 최소 0.3
+            double startAmp = Math.Max(0.3, naturalStd * 3.0);
+            startAmp = Math.Min(startAmp, _s.AdaptiveAmpMax);
 
-            // PID 복사본 생성 (원본 PID 상태를 건드리지 않기 위해)
-            var pidCopy = new PidStandardForm(
-                this._focus.Pid.kP.Us,
-                this._focus.Pid.kI.Us,
-                this._focus.Pid.kD.Us
-            );
+            // SP 가진: SetPointAdjust에 멀티사인 추가, 원본 PID는 그대로 동작
+            _s.ExciteEnabled = true;
+            _s.ExciteWave = WaveType.MultiSine;
+            _s.ExciteAmp = (float)startAmp;
+            _s.ExciteFreqHz = 0.05f;
+            _s.ChirpEndHz = (float)Math.Min(fs / 4.0, 2.0);
+            _s.AdaptiveAmp = true;
 
-            // SP 공급자: AI가 주는 원래 SP를 그대로 추종
-            // (FTD 내부 PID와 동일하게 동작)
-            Func<float> getSp = () => this._focus.GetCurrentController().LastSetPoint;
-
-            // PID + 가진 collector
-            double duration = _s.MinSamples * dt;
-            _pidExciteCollector = new PidPlusExciteCollector(
-                pidCopy, getSp,
-                startAmp, duration,
-                0.05, Math.Min(fs / 4.0, 2.0), 12);
-
-            // DataCollector로 등록 → FTD가 이걸 호출, 원본 PID는 우회
-            this._focus.DataCollector = _pidExciteCollector;
-
-            _sess.Clear();
-            _autoState = AutoTuneState.Recording; // Recording 상태 유지 (계산은 AutoTuneCompute 사용)
-            _sess.Recording = true;
-            _sess.LastMessage = $"PID+excite started (amp={startAmp:0.000}) / PID+가진 시작";
+            _autoState = AutoTuneState.Recording;
+            StartRecording();
+            _sess.AdaptiveCurrentAmp = _s.ExciteAmp;
+            _sess.LastMessage = $"Recording (SP excite, amp={startAmp:0.00}) / 녹화 중 (SP 가진)";
         }
 
         /// <summary>

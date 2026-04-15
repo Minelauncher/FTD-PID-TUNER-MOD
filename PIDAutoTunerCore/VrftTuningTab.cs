@@ -2008,7 +2008,8 @@ namespace PIDAutoTuner
                     double y_k = 0;
                     for (int jj = 0; jj < hLen && jj < k; jj++)
                         y_k += hImpulse[jj] * uSim[k - 1 - jj];
-                    ySim[k] = y_k * kvOrK_sign;
+                    // hImpulse는 이미 올바른 부호 포함 (Wiener deconvolution). 추가 부호 곱하지 않음.
+                    ySim[k] = y_k;
 
                     double e = r - ySim[k];
                     integ += e * dt;

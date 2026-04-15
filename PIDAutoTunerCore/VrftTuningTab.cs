@@ -2361,37 +2361,40 @@ namespace PIDAutoTuner
             for (int k = 0; k < nComp; k++)
                 freqs[k] = fBase * Math.Pow(fMax / fBase, (double)k / (nComp - 1));
 
-            // 2. FRF (도구변수법, 폐루프 편향 제거)
-            var frf = BlaIdentifier.EstimateFrf(u, y, r, freqs, dt);
+            // 2. Welch-평균 FRF (도구변수법, 폐루프 노이즈/편향 감소)
+            //    윈도우 수는 데이터 길이로 조정: N 짧으면 M=1 폴백
+            int numSeg = N < 400 ? 1 : (N < 800 ? 3 : 4);
+            var frf = BlaIdentifier.EstimateFrf(u, y, r, freqs, dt, numSeg);
 
-            // 신뢰도 점검: 유효 bin 수
+            // 신뢰도 점검: γ² 기반. 0.3 이상이면 "합리적", 0.5 이상 "우수"
+            const double COH_MIN = 0.3;
             int validBins = 0;
             double meanCoh = 0;
             for (int k = 0; k < nComp; k++)
             {
-                if (frf.Coherence[k] > 0.05 && !double.IsNaN(frf.G[k].Magnitude))
+                if (frf.Coherence[k] > COH_MIN && !double.IsNaN(frf.G[k].Magnitude) && !double.IsInfinity(frf.G[k].Magnitude))
                 {
                     validBins++;
                     meanCoh += frf.Coherence[k];
                 }
             }
-            if (validBins < 4) throw new Exception($"BLA: only {validBins} usable bins");
+            if (validBins < 4) throw new Exception($"BLA: only {validBins}/{nComp} bins have γ²>{COH_MIN}");
             meanCoh /= Math.Max(1, validBins);
 
-            // 3. 참조 모델 시상수: 가진 대역 중심에서 결정
-            //    fBand = √(fBase·fMax) (기하평균), τ_M = 1/(2π·fBand·2)
+            // 3. 참조 모델 시상수
             double fBand = Math.Sqrt(fBase * fMax);
             double tauM = 1.0 / (2 * Math.PI * fBand * 2.0);
 
-            // 4. PSO + 주파수 도메인 비용
-            //    cost = Σ_k |T_pred(jω_k) - M(jω_k)|²  (유효 bin 만)
+            // 4. PSO + 주파수 도메인 비용 (coherence 가중)
+            //    cost = Σ_k γ²_k · |T_pred(jω_k) - M(jω_k)|²
+            //    신뢰도 낮은 bin 영향 자동 감소
             Func<double, double, double, double> evaluate = (tryKp, tryTi, tryTd) =>
             {
                 double cost = 0;
-                int used = 0;
+                double totalWeight = 0;
                 for (int k = 0; k < nComp; k++)
                 {
-                    if (frf.Coherence[k] < 0.05) continue;
+                    if (frf.Coherence[k] < COH_MIN) continue;
                     if (double.IsNaN(frf.G[k].Magnitude) || double.IsInfinity(frf.G[k].Magnitude)) continue;
 
                     double omega = 2 * Math.PI * freqs[k];
@@ -2400,11 +2403,12 @@ namespace PIDAutoTuner
                     var T_pred = GK / (Complex.One + GK);
                     var M = BlaIdentifier.ReferenceModel(omega, tauM, dt);
                     var err = T_pred - M;
-                    cost += err.Real * err.Real + err.Imaginary * err.Imaginary;
-                    used++;
+                    double w_k = frf.Coherence[k]; // γ² ∈ (COH_MIN, 1]
+                    cost += w_k * (err.Real * err.Real + err.Imaginary * err.Imaginary);
+                    totalWeight += w_k;
                 }
-                if (used == 0) return double.MaxValue;
-                return cost / used;
+                if (totalWeight < 1e-10) return double.MaxValue;
+                return cost / totalWeight;
             };
 
             // PSO (같은 구조: 멀티시드, log-공간 탐색)
@@ -2480,13 +2484,13 @@ namespace PIDAutoTuner
             double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBestG[1])));
             double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBestG[2])));
 
-            // BLA 신뢰도: 평균 coherence (높을수록 r 우세, 노이즈 적음)
-            string info = $"BLA bins={validBins}/{nComp} coh={meanCoh:0.00} τM={tauM:0.00} cost={gBestCostG:0.000e0}";
+            // BLA 신뢰도: 평균 γ² (1=완전 선형 종속, 0=무상관). 1-γ² 를 IdentRatio 로 변환.
+            string info = $"BLA seg={frf.NumSegments}×{frf.SegmentLength} bins={validBins}/{nComp} γ²={meanCoh:0.00} τM={tauM:0.00} cost={gBestCostG:0.000e0}";
             return new ModelPidResult
             {
                 Kp = bestKp, Ti = bestTi, Td = bestTd,
                 ModelInfo = info,
-                IdentRatio = 1.0 - meanCoh  // 일치 메트릭으로 전환 (낮을수록 신뢰)
+                IdentRatio = 1.0 - meanCoh  // 낮을수록 신뢰 (γ² 높음)
             };
         }
 

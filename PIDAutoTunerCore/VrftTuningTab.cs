@@ -221,6 +221,9 @@ namespace PIDAutoTuner
             public bool AdaptiveAmp = true;         // 적응형 켤지
             public float AdaptiveAmpMax = 10.0f;    // 최대 허용 진폭
             public float AdaptiveSnrTarget = 0.15f; // stddev(y)/amp가 이보다 작으면 진폭 증가
+
+            // ===== 축 분리 (Axis Fixture) =====
+            public bool FixOtherAxes = true;        // 튜닝 중 다른 축 SP 고정
         }
 
         /// <summary>
@@ -337,6 +340,16 @@ namespace PIDAutoTuner
             }
         }
 
+        // ── 축 분리 모드 (Axis Fixture) ──
+        // 사용자가 여러 축의 PID UI 를 열면 각 tab 이 자기 축을 _tabsByAxis 에 등록.
+        // 튜닝 시작 시 이 registry 에서 *다른* 축의 SP 를 현재 값으로 freeze,
+        // Recording 중 매 틱 재적용 → 자세/고도 유지 (기존 PID 가 0 SP 따라감).
+        // 사용자가 튜닝 전에 각 축 UI 한 번씩 열어놓아야 함.
+        private static readonly Dictionary<VariableControllerMaster, VrftTuningTab> _tabsByAxis
+            = new Dictionary<VariableControllerMaster, VrftTuningTab>();
+        private readonly Dictionary<VariableControllerMaster, float> _frozenOtherSPs
+            = new Dictionary<VariableControllerMaster, float>();
+
         // 가진 적용 시 원래 SetPoint를 백업해두고, 녹화 끝나면 복원하기 위한 변수.
         // SetPointAdjust = FTD에서 PID의 목표값을 외부에서 조절하는 파라미터.
         private bool _hasBaseSetPointAdjust;
@@ -357,6 +370,9 @@ namespace PIDAutoTuner
         {
             // Name = 탭 이름. Content(표시텍스트, 툴팁, 내부ID)
             this.Name = new Content("VRFT Tuning / VRFT 튜닝", new ToolTip("Auto-estimate PID (Kp, Ti, Td) via VRFT.\n---\nVRFT로 PID(Kp, Ti, Td)를 자동 추정합니다.", 220f), "vrft");
+
+            // 정적 registry 에 등록 — 다른 축 튜닝 시 이 축 SP 고정 대상으로 사용
+            if (focus != null) _tabsByAxis[focus] = this;
         }
 
         /// <summary>
@@ -573,6 +589,7 @@ namespace PIDAutoTuner
                 if (dt <= 0) dt = 0.02;
 
                 ApplyExcitation((float)dt);
+                ApplyOtherAxesFixture();  // 다른 축 SP 재적용 (매 틱) — 자세/고도 유지
 
                 IVariableController c = this._focus.GetCurrentController();
                 if (c == null) return;
@@ -821,6 +838,18 @@ namespace PIDAutoTuner
                 "excite"
             ));
 
+            seg.AddInterpretter(MakeToggle(
+                "Fix other axes / 다른 축 고정",
+                "During tuning, other axes' SetPoints are frozen at captured values\n" +
+                "so existing PIDs hold attitude/altitude. Open each axis's PID UI\n" +
+                "once before tuning to register it.\n---\n" +
+                "튜닝 중 다른 축 SP를 캡처 값에 고정 → 기존 PID가 자세/고도 유지.\n" +
+                "튜닝 전 각 축 PID UI를 한 번씩 열어 등록 필요.",
+                () => _s.FixOtherAxes,
+                b => _s.FixOtherAxes = b,
+                "fixaxes"
+            ));
+
             ScreenSegmentTable excTable = base.CreateTableSegment(1, 3);
             excTable.SqueezeTable = false;
 
@@ -1039,12 +1068,14 @@ namespace PIDAutoTuner
             _sess.LastMessage = "Recording started / 녹화 시작";
 
             CaptureSetPointAdjustBase();
+            CaptureOtherAxesFixture();
         }
 
         private void StopRecording()
         {
             _sess.Recording = false;
             RestoreSetPointAdjustIfNeeded();
+            ReleaseOtherAxesFixture();
 
             // DataCollector 및 컬렉터 정리 (안전)
             try { if (this._focus != null) this._focus.DataCollector = null; } catch { }
@@ -1053,6 +1084,45 @@ namespace PIDAutoTuner
             if (_autoState == AutoTuneState.Recording)
                 _autoState = AutoTuneState.Idle;
             _sess.LastMessage = "Recording stopped / 녹화 중지";
+        }
+
+        // ============================================================
+        // Axis Fixture — 다른 축 SP 고정 (기존 PID 가 alt/attitude 유지하게)
+        // ============================================================
+
+        /// <summary>
+        /// 튜닝 시작 시 호출. 현재 등록된 모든 다른 축의 SP 를 캡처.
+        /// Recording 중 매 틱 ApplyOtherAxesFixture() 가 이 값으로 재적용.
+        /// </summary>
+        private void CaptureOtherAxesFixture()
+        {
+            _frozenOtherSPs.Clear();
+            if (!_s.FixOtherAxes) return;
+
+            foreach (var kv in _tabsByAxis)
+            {
+                VariableControllerMaster axis = kv.Key;
+                if (axis == null || axis == this._focus) continue;
+                try { _frozenOtherSPs[axis] = axis.SetPointAdjust.Us; }
+                catch { }
+            }
+        }
+
+        /// <summary>매 틱 호출. 다른 축 SP 를 freeze 값으로 재적용. 기존 PID 가 이 SP 추종.</summary>
+        private void ApplyOtherAxesFixture()
+        {
+            if (_frozenOtherSPs.Count == 0) return;
+            foreach (var kv in _frozenOtherSPs)
+            {
+                try { kv.Key.SetPointAdjust.Us = kv.Value; }
+                catch { }
+            }
+        }
+
+        /// <summary>튜닝 종료 시. freeze 해제 — 다른 축 SP 가 다시 AI 에 의해 제어됨.</summary>
+        private void ReleaseOtherAxesFixture()
+        {
+            _frozenOtherSPs.Clear();
         }
 
         // ============================================================

@@ -235,6 +235,7 @@ namespace PIDAutoTuner
 
             public readonly List<double> U = new List<double>();  // 제어 출력 기록
             public readonly List<double> Y = new List<double>();  // 프로세스 변수 기록
+            public readonly List<double> R = new List<double>();  // 가진 신호 (외생) — PEM 폐루프 식별용
 
             // MISO N4SID용: 다른 축의 u 기록 (커플링 분리)
             public readonly List<List<double>> OtherU = new List<List<double>>();
@@ -275,6 +276,7 @@ namespace PIDAutoTuner
                 T = 0;
                 U.Clear();
                 Y.Clear();
+                R.Clear();
                 OtherU.Clear();
                 BlockStarts.Clear();
                 BlockStarts.Add(0);
@@ -635,6 +637,7 @@ namespace PIDAutoTuner
 
                 _sess.U.Add(u);
                 _sess.Y.Add(y);
+                _sess.R.Add(_lastExciteValue); // 외생 가진 신호 (PEM 폐루프 식별용)
 
                 // 다른 축 u도 기록 (MISO N4SID용)
                 while (_sess.OtherU.Count < _otherAxes.Count)
@@ -1213,33 +1216,35 @@ namespace PIDAutoTuner
             _s.SettlingTimeTs = (float)bestTs;
             VrftResult vrft = bestResult;
 
-            // N4SID 모델 식별 (주력) — 성공하면 전체 PID 사용, 실패하면 VRFT fallback
+            // 식별 우선순위: PEM (PBSID-opt + GN, 폐루프 무편향, CRLB 도달) → N4SID → VRFT
             double finalKp, finalTi, finalTd;
             string method;
             try
             {
-                // 다른 축 u 데이터 준비 (최장 블록과 동일 구간)
-                double[][] otherU = new double[_sess.OtherU.Count][];
-                for (int ai = 0; ai < _sess.OtherU.Count; ai++)
-                {
-                    otherU[ai] = new double[blkLen];
-                    if (_sess.OtherU[ai].Count >= blkStart + blkLen)
-                        _sess.OtherU[ai].CopyTo(blkStart, otherU[ai], 0, blkLen);
-                }
-                ModelPidResult mr = ComputeModelPid(u, y, dt, otherU);
-
-                finalKp = mr.Kp;
-                finalTi = mr.Ti;
-                finalTd = mr.Td;
-                method = mr.ModelInfo;
+                ModelPidResult pem = ComputePemPid(u, y, dt);
+                finalKp = pem.Kp; finalTi = pem.Ti; finalTd = pem.Td;
+                method = pem.ModelInfo;
             }
             catch
             {
-                // N4SID 실패 → VRFT fallback
-                finalKp = vrft.Kp;
-                finalTi = vrft.Ti;
-                finalTd = vrft.Td;
-                method = $"VRFT (N4SID failed) Ts={bestTs:0.00}";
+                try
+                {
+                    double[][] otherU = new double[_sess.OtherU.Count][];
+                    for (int ai = 0; ai < _sess.OtherU.Count; ai++)
+                    {
+                        otherU[ai] = new double[blkLen];
+                        if (_sess.OtherU[ai].Count >= blkStart + blkLen)
+                            _sess.OtherU[ai].CopyTo(blkStart, otherU[ai], 0, blkLen);
+                    }
+                    ModelPidResult mr = ComputeModelPid(u, y, dt, otherU);
+                    finalKp = mr.Kp; finalTi = mr.Ti; finalTd = mr.Td;
+                    method = "(PEM failed) " + mr.ModelInfo;
+                }
+                catch
+                {
+                    finalKp = vrft.Kp; finalTi = vrft.Ti; finalTd = vrft.Td;
+                    method = $"VRFT (PEM+N4SID failed) Ts={bestTs:0.00}";
+                }
             }
 
             _sess.HasResult = true;
@@ -1282,8 +1287,12 @@ namespace PIDAutoTuner
         /// - PID가 안정적으로 잘 작동하면 u/y가 거의 일정 → 플랜트 정보 없음
         /// - 외부에서 SP를 흔들어야 PID가 반응하고, 그 반응에서 플랜트 특성이 드러남
         /// </summary>
+        /// <summary>현재 틱의 가진 신호값 (PEM 폐루프 식별용 외생 입력 r). 비활성/조건 미충족 시 0.</summary>
+        private double _lastExciteValue = 0.0;
+
         private void ApplyExcitation(float dt)
         {
+            _lastExciteValue = 0.0;
             if (!_s.ExciteEnabled) return;        // 가진 꺼져있으면 무시
             if (_s.ExciteWave == WaveType.Off) return;
             if (!_hasBaseSetPointAdjust) return;   // 원래 SP를 백업 못 했으면 무시
@@ -1358,6 +1367,7 @@ namespace PIDAutoTuner
                     }
             }
 
+            _lastExciteValue = x;
             try
             {
                 this._focus.SetPointAdjust.Us = _baseSetPointAdjust + (float)x;
@@ -2024,6 +2034,178 @@ namespace PIDAutoTuner
             string modelInfoStr = $"N4SID n={order} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} cost={gBestCost:0.000}";
 
             return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = modelInfoStr };
+        }
+
+        // ============================================================
+        // PEM (PBSID-opt + Gauss-Newton 정련) → 폐루프 무편향 식별
+        // CRLB 점근적 도달. 표준 산업 파이프라인 (MATLAB n4sid+ssest 구조).
+        // ============================================================
+        private static ModelPidResult ComputePemPid(double[] u, double[] y, double dt)
+        {
+            int N = Math.Min(u.Length, y.Length);
+            if (N < 200) throw new Exception("Too few samples for PEM (need >= 200)");
+
+            // ── 1. PBSID-opt 초기 식별 ──
+            int pastP = Math.Min(30, N / 8);
+            var initModel = PemIdentifier.IdentifyPbsid(u, y, pastP);
+
+            // ── 2. PEM 정련 (LM + finite-difference Jacobian) ──
+            var refined = PemIdentifier.RefinePem(initModel, u, y, maxIter: 15, tol: 1e-6);
+            int n = refined.Order;
+            var A = refined.A;
+            var B = refined.B;
+            var C = refined.C;
+            double D_sc = refined.D;
+
+            // ── 3. 모델 분석 ──
+            var eigA = A.Evd();
+            double dominantTau = dt;
+            for (int k = 0; k < n; k++)
+            {
+                double mag = eigA.EigenValues[k].Magnitude;
+                if (mag < 1e-10 || mag >= 1.0) continue;
+                double tau_k = -dt / Math.Log(mag);
+                if (tau_k > dominantTau) dominantTau = tau_k;
+            }
+
+            double dcGain;
+            try
+            {
+                var IA = MB.DenseIdentity(n) - A;
+                var IAB = IA.Solve(B);
+                dcGain = D_sc;
+                for (int k = 0; k < n; k++) dcGain += C[0, k] * IAB[k, 0];
+            }
+            catch { dcGain = double.NaN; }
+
+            // ── 4. PSO + 폐루프 시뮬 (1-샘플 지연 측정) ──
+            // 결정론적 모델 (A,B,C,D) 사용; Kalman gain K는 노이즈용이므로 시뮬에서 제외
+            int simLen = Math.Min(800, Math.Max(200, (int)(6.0 * dominantTau / dt)));
+            double targetTs = Math.Max(0.5, 2.0 * dominantTau);
+            double tauM = 0.2 * targetTs;
+
+            double[] yTarget = new double[simLen];
+            for (int k = 0; k < simLen; k++)
+            {
+                double tm = k * dt / tauM;
+                yTarget[k] = 1.0 - (1.0 + tm) * Math.Exp(-tm);
+            }
+
+            double[,] Ac = new double[n, n];
+            double[] Bc = new double[n];
+            double[] Cc = new double[n];
+            for (int r = 0; r < n; r++)
+            {
+                for (int c = 0; c < n; c++) Ac[r, c] = A[r, c];
+                Bc[r] = B[r, 0];
+                Cc[r] = C[0, r];
+            }
+            double Dc = D_sc;
+
+            Func<double, double, double, double> evaluate = (tryKp, tryTi, tryTd) =>
+            {
+                double[] x = new double[n];
+                double[] xNext = new double[n];
+                double integ = 0, prevE = 0, yMeas = 0, maxY = 0, cost = 0;
+
+                for (int k = 0; k < simLen; k++)
+                {
+                    double r = 1.0;
+                    double e = r - yMeas;
+                    integ += e * dt;
+                    double deriv = (k > 0) ? (e - prevE) / dt : 0;
+                    prevE = e;
+
+                    double uk = tryKp * (e + integ / tryTi + tryTd * deriv);
+                    if (uk > 1.0) uk = 1.0;
+                    else if (uk < -1.0) uk = -1.0;
+
+                    double yk = Dc * uk;
+                    for (int i2 = 0; i2 < n; i2++) yk += Cc[i2] * x[i2];
+
+                    for (int i2 = 0; i2 < n; i2++)
+                    {
+                        double s = Bc[i2] * uk;
+                        for (int jj = 0; jj < n; jj++) s += Ac[i2, jj] * x[jj];
+                        xNext[i2] = s;
+                    }
+                    var tmp = x; x = xNext; xNext = tmp;
+
+                    if (double.IsNaN(yk) || double.IsInfinity(yk) || Math.Abs(yk) > 100)
+                        return double.MaxValue;
+
+                    double err = yTarget[k] - yk;
+                    cost += k * dt * Math.Abs(err) * dt;
+                    if (yk > maxY) maxY = yk;
+                    yMeas = yk;
+                }
+                cost += 10.0 * Math.Max(0, maxY - 1.0);
+                return cost;
+            };
+
+            const int nParticles = 20;
+            const int maxIter = 30;
+            const double w_pso = 0.7;
+            const double c1 = 1.5;
+            const double c2 = 1.5;
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
+            double[] hi = { Math.Log(1.0),   Math.Log(50.0), Math.Log(1.0)   };
+
+            var rng = new System.Random(42);
+            double[][] pos = new double[nParticles][];
+            double[][] vel = new double[nParticles][];
+            double[][] pBest = new double[nParticles][];
+            double[] pBestCost = new double[nParticles];
+            double[] gBest = new double[3];
+            double gBestCost = double.MaxValue;
+
+            for (int p = 0; p < nParticles; p++)
+            {
+                pos[p] = new double[3]; vel[p] = new double[3]; pBest[p] = new double[3];
+                for (int d = 0; d < 3; d++)
+                {
+                    pos[p][d] = lo[d] + rng.NextDouble() * (hi[d] - lo[d]);
+                    vel[p][d] = (rng.NextDouble() - 0.5) * (hi[d] - lo[d]) * 0.1;
+                    pBest[p][d] = pos[p][d];
+                }
+                double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
+                pBestCost[p] = cost;
+                if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
+            }
+
+            for (int it = 0; it < maxIter; it++)
+            {
+                for (int p = 0; p < nParticles; p++)
+                {
+                    for (int d = 0; d < 3; d++)
+                    {
+                        double r1 = rng.NextDouble();
+                        double r2 = rng.NextDouble();
+                        vel[p][d] = w_pso * vel[p][d]
+                                  + c1 * r1 * (pBest[p][d] - pos[p][d])
+                                  + c2 * r2 * (gBest[d] - pos[p][d]);
+                        pos[p][d] += vel[p][d];
+                        if (pos[p][d] < lo[d]) { pos[p][d] = lo[d]; vel[p][d] = 0; }
+                        if (pos[p][d] > hi[d]) { pos[p][d] = hi[d]; vel[p][d] = 0; }
+                    }
+                    double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
+                    if (cost < pBestCost[p])
+                    {
+                        pBestCost[p] = cost;
+                        Array.Copy(pos[p], pBest[p], 3);
+                        if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
+                    }
+                }
+            }
+
+            double bestKp = Math.Max(0.001, Math.Min(1.0,   Math.Exp(gBest[0])));
+            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBest[1])));
+            double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBest[2])));
+
+            string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
+            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} cost={gBestCost:0.000}";
+
+            return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info };
         }
 
         // ============================================================

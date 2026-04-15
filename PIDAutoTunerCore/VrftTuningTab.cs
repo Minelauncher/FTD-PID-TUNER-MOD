@@ -235,6 +235,7 @@ namespace PIDAutoTuner
 
             public readonly List<double> U = new List<double>();  // 제어 출력 기록
             public readonly List<double> Y = new List<double>();  // 프로세스 변수 기록
+            public readonly List<double> R = new List<double>();  // 가진 신호 (외생) — BLA 폐루프 편향 제거용
 
             // MISO N4SID용: 다른 축의 u 기록 (커플링 분리)
             public readonly List<List<double>> OtherU = new List<List<double>>();
@@ -285,6 +286,7 @@ namespace PIDAutoTuner
                 T = 0;
                 U.Clear();
                 Y.Clear();
+                R.Clear();
                 OtherU.Clear();
                 BlockStarts.Clear();
                 BlockStarts.Add(0);
@@ -666,6 +668,7 @@ namespace PIDAutoTuner
 
                 _sess.U.Add(u);
                 _sess.Y.Add(y);
+                _sess.R.Add(_lastExciteValue); // 외생 가진 신호 (BLA 무편향 식별용)
 
                 // 다른 축 u도 기록 (MISO N4SID용)
                 while (_sess.OtherU.Count < _otherAxes.Count)
@@ -1148,6 +1151,10 @@ namespace PIDAutoTuner
             _sess.U.CopyTo(blkStart, u, 0, blkLen);
             _sess.Y.CopyTo(blkStart, y, 0, blkLen);
 
+            // BLA 용 r (가진 신호) — 같은 블록 구간 추출. R 가 부족하면 빈 배열
+            double[] r = (_sess.R.Count >= blkStart + blkLen) ? new double[blkLen] : Array.Empty<double>();
+            if (r.Length == blkLen) _sess.R.CopyTo(blkStart, r, 0, blkLen);
+
             // 데이터 품질 체크
             double satRatio = (double)_sess.SaturatedCount / Math.Max(1, _sess.SaturatedCount + _sess.U.Count);
             if (satRatio > 0.5)
@@ -1261,62 +1268,59 @@ namespace PIDAutoTuner
             _s.SettlingTimeTs = (float)bestTs;
             VrftResult vrft = bestResult;
 
-            // PEM + VRFT 둘 다 계산. PEM 신뢰도에 따라 자동 선택, 다른 쪽은 대안으로 보존.
-            //   identRatio = innovation RMS / std(y)  (낮을수록 모델 신뢰 ↑)
-            //   < 0.3 : PEM 을 주력으로 사용, VRFT 를 대안으로 보존
-            //   ≥ 0.3 또는 PEM 실패 : VRFT 를 주력으로 사용, PEM 을 대안으로 (성공했으면)
-            const double IDENT_THRESHOLD = 0.3;
+            // 3-way 식별: PEM / BLA / VRFT 모두 계산 후 신뢰도로 정렬.
+            //   PEM identRatio (innovation RMS / std(y)): 낮을수록 신뢰
+            //   BLA identRatio (1 - mean coherence): 낮을수록 신뢰 (coherence 높음)
+            //   VRFT: 항상 가능 (신뢰도 메트릭 없음, 폴백)
+            // 우선순위: 가장 낮은 IdentRatio 를 가진 모델이 주력, 차순위가 대안.
+            const double IDENT_THRESHOLD = 0.5; // 이보다 크면 신뢰 X (VRFT로 폴백)
 
-            bool pemOk = false;
             ModelPidResult pemResult = default;
-            string pemInfo = "";
-            try
+            ModelPidResult blaResult = default;
+            bool pemOk = false, blaOk = false;
+            string pemInfo = "", blaInfo = "";
+
+            try { pemResult = ComputePemPid(u, y, dt); pemOk = true; pemInfo = pemResult.ModelInfo; }
+            catch (Exception ex) { pemInfo = $"PEM failed: {ex.Message}"; }
+
+            // BLA 는 r 데이터 있을 때만
+            if (r.Length == blkLen)
             {
-                pemResult = ComputePemPid(u, y, dt);
-                pemOk = true;
-                pemInfo = pemResult.ModelInfo;
+                try { blaResult = ComputeBlaPid(u, y, r, dt, _s); blaOk = true; blaInfo = blaResult.ModelInfo; }
+                catch (Exception ex) { blaInfo = $"BLA failed: {ex.Message}"; }
             }
-            catch (Exception ex)
+            else
             {
-                pemInfo = $"PEM failed: {ex.Message}";
+                blaInfo = "BLA skipped: no excitation data";
             }
 
             string vrftInfo = $"VRFT Ts={bestTs:0.00} rmse={vrft.Rmse:0.00e0}";
 
-            // 자동 선택 로직
-            string primaryName, primaryInfo;
-            double primaryKp, primaryTi, primaryTd;
-            string altName, altInfo;
-            double altKp, altTi, altTd;
-            bool hasAlt;
+            // 후보들 점수 매김: (이름, IdentRatio, Result, Info)
+            var candidates = new List<(string name, double score, double Kp, double Ti, double Td, string info)>();
+            if (pemOk && pemResult.IdentRatio < IDENT_THRESHOLD)
+                candidates.Add(("PEM", pemResult.IdentRatio, pemResult.Kp, pemResult.Ti, pemResult.Td, pemInfo));
+            if (blaOk && blaResult.IdentRatio < IDENT_THRESHOLD)
+                candidates.Add(("BLA", blaResult.IdentRatio, blaResult.Kp, blaResult.Ti, blaResult.Td, blaInfo));
+            // VRFT 는 항상 후보 (낮은 우선순위로 score=0.99)
+            candidates.Add(("VRFT", 0.99, vrft.Kp, vrft.Ti, vrft.Td, vrftInfo));
 
-            if (pemOk && !double.IsNaN(pemResult.IdentRatio) && pemResult.IdentRatio < IDENT_THRESHOLD)
+            candidates.Sort((a, b) => a.score.CompareTo(b.score));
+
+            // 주력 = 1순위, 대안 = 2순위 (있으면)
+            var primary = candidates[0];
+            string primaryName = primary.name;
+            string primaryInfo = primary.info;
+            double primaryKp = primary.Kp, primaryTi = primary.Ti, primaryTd = primary.Td;
+
+            string altName = "", altInfo = "";
+            double altKp = 0, altTi = 0, altTd = 0;
+            bool hasAlt = candidates.Count >= 2;
+            if (hasAlt)
             {
-                // PEM 신뢰 → 주력
-                primaryName = "PEM";
-                primaryInfo = pemInfo;
-                primaryKp = pemResult.Kp; primaryTi = pemResult.Ti; primaryTd = pemResult.Td;
-                altName = "VRFT"; altInfo = vrftInfo;
-                altKp = vrft.Kp; altTi = vrft.Ti; altTd = vrft.Td;
-                hasAlt = true;
-            }
-            else
-            {
-                // PEM 실패 또는 불신뢰 → VRFT 주력
-                primaryName = "VRFT";
-                primaryInfo = vrftInfo + (pemOk ? $" (PEM ident={pemResult.IdentRatio:0.00} > {IDENT_THRESHOLD} 불신뢰)" : $" ({pemInfo})");
-                primaryKp = vrft.Kp; primaryTi = vrft.Ti; primaryTd = vrft.Td;
-                if (pemOk)
-                {
-                    altName = "PEM"; altInfo = pemInfo;
-                    altKp = pemResult.Kp; altTi = pemResult.Ti; altTd = pemResult.Td;
-                    hasAlt = true;
-                }
-                else
-                {
-                    altName = ""; altInfo = ""; altKp = altTi = altTd = 0;
-                    hasAlt = false;
-                }
+                var alt = candidates[1];
+                altName = alt.name; altInfo = alt.info;
+                altKp = alt.Kp; altTi = alt.Ti; altTd = alt.Td;
             }
 
             _sess.HasResult = true;
@@ -1376,8 +1380,12 @@ namespace PIDAutoTuner
         /// - PID가 안정적으로 잘 작동하면 u/y가 거의 일정 → 플랜트 정보 없음
         /// - 외부에서 SP를 흔들어야 PID가 반응하고, 그 반응에서 플랜트 특성이 드러남
         /// </summary>
+        /// <summary>현재 틱 가진값 (BLA 폐루프 식별용 외생 입력 r). 비활성/조건 미충족 시 0.</summary>
+        private double _lastExciteValue = 0.0;
+
         private void ApplyExcitation(float dt)
         {
+            _lastExciteValue = 0.0;
             if (!_s.ExciteEnabled) return;        // 가진 꺼져있으면 무시
             if (_s.ExciteWave == WaveType.Off) return;
             if (!_hasBaseSetPointAdjust) return;   // 원래 SP를 백업 못 했으면 무시
@@ -1452,6 +1460,7 @@ namespace PIDAutoTuner
                     }
             }
 
+            _lastExciteValue = x;
             try
             {
                 this._focus.SetPointAdjust.Us = _baseSetPointAdjust + (float)x;
@@ -2325,6 +2334,160 @@ namespace PIDAutoTuner
             string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} ident={identRatio:0.00} cost={globalBestCost:0.000}";
 
             return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info, IdentRatio = identRatio };
+        }
+
+        // ============================================================
+        // BLA (Best Linear Approximation) — Frequency-domain ML
+        // 멀티사인 가진 + 도구변수 (r) 로 폐루프 무편향 FRF 추정.
+        // 주파수 도메인에서 직접 PID 매칭 (파라미터 SS 모델 생략).
+        // 참조: Pintelon-Schoukens 2012.
+        // ============================================================
+        private static ModelPidResult ComputeBlaPid(double[] u, double[] y, double[] r, double dt, Settings s)
+        {
+            int N = Math.Min(Math.Min(u.Length, y.Length), r.Length);
+            if (N < 200) throw new Exception("Too few samples for BLA (need >= 200)");
+
+            // 입력 sanity
+            double sumR = 0, sumR2 = 0;
+            for (int i = 0; i < N; i++) { sumR += r[i]; sumR2 += r[i] * r[i]; }
+            double stdR = Math.Sqrt(Math.Max(0, sumR2 / N - (sumR / N) * (sumR / N)));
+            if (stdR < 1e-5) throw new Exception($"Excitation r std too low ({stdR:0.0e})");
+
+            // 1. 멀티사인 주파수 재구성 (settings에서, ApplyExcitation 과 동일 식)
+            double fBase = Math.Max(0.01, s.ExciteFreqHz);
+            double fMax = Math.Max(fBase * 2.0, s.ChirpEndHz);
+            const int nComp = 12;
+            double[] freqs = new double[nComp];
+            for (int k = 0; k < nComp; k++)
+                freqs[k] = fBase * Math.Pow(fMax / fBase, (double)k / (nComp - 1));
+
+            // 2. FRF (도구변수법, 폐루프 편향 제거)
+            var frf = BlaIdentifier.EstimateFrf(u, y, r, freqs, dt);
+
+            // 신뢰도 점검: 유효 bin 수
+            int validBins = 0;
+            double meanCoh = 0;
+            for (int k = 0; k < nComp; k++)
+            {
+                if (frf.Coherence[k] > 0.05 && !double.IsNaN(frf.G[k].Magnitude))
+                {
+                    validBins++;
+                    meanCoh += frf.Coherence[k];
+                }
+            }
+            if (validBins < 4) throw new Exception($"BLA: only {validBins} usable bins");
+            meanCoh /= Math.Max(1, validBins);
+
+            // 3. 참조 모델 시상수: 가진 대역 중심에서 결정
+            //    fBand = √(fBase·fMax) (기하평균), τ_M = 1/(2π·fBand·2)
+            double fBand = Math.Sqrt(fBase * fMax);
+            double tauM = 1.0 / (2 * Math.PI * fBand * 2.0);
+
+            // 4. PSO + 주파수 도메인 비용
+            //    cost = Σ_k |T_pred(jω_k) - M(jω_k)|²  (유효 bin 만)
+            Func<double, double, double, double> evaluate = (tryKp, tryTi, tryTd) =>
+            {
+                double cost = 0;
+                int used = 0;
+                for (int k = 0; k < nComp; k++)
+                {
+                    if (frf.Coherence[k] < 0.05) continue;
+                    if (double.IsNaN(frf.G[k].Magnitude) || double.IsInfinity(frf.G[k].Magnitude)) continue;
+
+                    double omega = 2 * Math.PI * freqs[k];
+                    var Kctrl = BlaIdentifier.PidFreqResponseRad(tryKp, tryTi, tryTd, omega);
+                    var GK = frf.G[k] * Kctrl;
+                    var T_pred = GK / (Complex.One + GK);
+                    var M = BlaIdentifier.ReferenceModel(omega, tauM, dt);
+                    var err = T_pred - M;
+                    cost += err.Real * err.Real + err.Imaginary * err.Imaginary;
+                    used++;
+                }
+                if (used == 0) return double.MaxValue;
+                return cost / used;
+            };
+
+            // PSO (같은 구조: 멀티시드, log-공간 탐색)
+            const int nParticles = 20;
+            const int maxIter = 30;
+            const double w_pso = 0.7;
+            const double c1 = 1.5;
+            const double c2 = 1.5;
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
+            double[] hi = { Math.Log(1.0),   Math.Log(50.0), Math.Log(1.0)   };
+
+            int[] seeds = { 42, 17, 83 };
+            double[] gBestG = new double[3];
+            double gBestCostG = double.MaxValue;
+
+            foreach (int seed in seeds)
+            {
+                var rng = new System.Random(seed);
+                double[][] pos = new double[nParticles][];
+                double[][] vel = new double[nParticles][];
+                double[][] pBest = new double[nParticles][];
+                double[] pBestCost = new double[nParticles];
+                double[] gBest = new double[3];
+                double gBestCost = double.MaxValue;
+
+                for (int p = 0; p < nParticles; p++)
+                {
+                    pos[p] = new double[3]; vel[p] = new double[3]; pBest[p] = new double[3];
+                    for (int d = 0; d < 3; d++)
+                    {
+                        pos[p][d] = lo[d] + rng.NextDouble() * (hi[d] - lo[d]);
+                        vel[p][d] = (rng.NextDouble() - 0.5) * (hi[d] - lo[d]) * 0.1;
+                        pBest[p][d] = pos[p][d];
+                    }
+                    double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
+                    pBestCost[p] = cost;
+                    if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
+                }
+
+                for (int it = 0; it < maxIter; it++)
+                {
+                    for (int p = 0; p < nParticles; p++)
+                    {
+                        for (int d = 0; d < 3; d++)
+                        {
+                            double r1 = rng.NextDouble();
+                            double r2 = rng.NextDouble();
+                            vel[p][d] = w_pso * vel[p][d]
+                                      + c1 * r1 * (pBest[p][d] - pos[p][d])
+                                      + c2 * r2 * (gBest[d] - pos[p][d]);
+                            pos[p][d] += vel[p][d];
+                            if (pos[p][d] < lo[d]) { pos[p][d] = lo[d]; vel[p][d] = 0; }
+                            if (pos[p][d] > hi[d]) { pos[p][d] = hi[d]; vel[p][d] = 0; }
+                        }
+                        double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
+                        if (cost < pBestCost[p])
+                        {
+                            pBestCost[p] = cost;
+                            Array.Copy(pos[p], pBest[p], 3);
+                            if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
+                        }
+                    }
+                }
+
+                if (gBestCost < gBestCostG)
+                {
+                    gBestCostG = gBestCost;
+                    Array.Copy(gBest, gBestG, 3);
+                }
+            }
+
+            double bestKp = Math.Max(0.001, Math.Min(1.0,   Math.Exp(gBestG[0])));
+            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBestG[1])));
+            double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBestG[2])));
+
+            // BLA 신뢰도: 평균 coherence (높을수록 r 우세, 노이즈 적음)
+            string info = $"BLA bins={validBins}/{nComp} coh={meanCoh:0.00} τM={tauM:0.00} cost={gBestCostG:0.000e0}";
+            return new ModelPidResult
+            {
+                Kp = bestKp, Ti = bestTi, Td = bestTd,
+                ModelInfo = info,
+                IdentRatio = 1.0 - meanCoh  // 일치 메트릭으로 전환 (낮을수록 신뢰)
+            };
         }
 
         // ============================================================

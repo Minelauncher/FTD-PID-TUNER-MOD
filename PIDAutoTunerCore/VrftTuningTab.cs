@@ -266,6 +266,14 @@ namespace PIDAutoTuner
             public bool HasResult;
             public double Kp, Ti, Td;
             public double FitRmse;
+            public string ActiveMethodName = "";     // 현재 활성 결과 ("PEM" / "VRFT" / ...)
+            public string ActiveMethodInfo = "";     // 상세 정보 문자열
+
+            // 대안 결과 (사용자가 스왑 가능). 사용 안 하면 HasAlt=false.
+            public bool HasAlt;
+            public double AltKp, AltTi, AltTd;
+            public string AltMethodName = "";
+            public string AltMethodInfo = "";
 
             public string LastMessage = "";
 
@@ -292,6 +300,10 @@ namespace PIDAutoTuner
                 NaturalYStd = 0;
                 HasResult = false;
                 Kp = Ti = Td = FitRmse = 0;
+                ActiveMethodName = ActiveMethodInfo = "";
+                HasAlt = false;
+                AltKp = AltTi = AltTd = 0;
+                AltMethodName = AltMethodInfo = "";
                 LastMessage = "";
             }
         }
@@ -860,6 +872,12 @@ namespace PIDAutoTuner
                 "Apply Kp/Ti/Td to PID. (Kp: 0.001, Ti/Td: 0.1 step)\n---\nKp/Ti/Td를 PID에 적용. (Kp: 0.001, Ti/Td: 0.1 단위)",
                 _ => ApplyToPid()
             ));
+
+            seg.AddInterpretter(MakeButton(
+                "Swap method / 방법 전환",
+                "Swap active result with alternative (PEM ↔ VRFT).\nAuto-selected based on PEM innovation RMS; override here.\n---\n주 결과와 대안 결과를 교체 (PEM ↔ VRFT).\n자동 선택을 수동으로 뒤집을 때 사용.",
+                _ => SwapPidMethod()
+            ));
         }
 
         private void BuildResult()
@@ -877,12 +895,23 @@ namespace PIDAutoTuner
                     if (!_sess.HasResult)
                         return "No result yet. Press Compute. / 아직 결과가 없습니다.";
 
-                    string result =
+                    string methodLine = string.IsNullOrEmpty(_sess.ActiveMethodName)
+                        ? ""
+                        : $"Active: {_sess.ActiveMethodName}\n{_sess.ActiveMethodInfo}\n\n";
+                    string altLine = _sess.HasAlt
+                        ? $"\n\n── Alternative ({_sess.AltMethodName}) ──\n" +
+                          $"Kp = {_sess.AltKp:0.0000},  Ti = {_sess.AltTi:0.00} s,  Td = {_sess.AltTd:0.0000} s\n" +
+                          $"({_sess.AltMethodInfo})\n" +
+                          $"→ 'Swap method' 버튼으로 전환 가능"
+                        : "";
+
+                    string result = methodLine +
                         $"── Single PID ──\n" +
                         $"Kp = {_sess.Kp:0.0000}\n" +
                         $"Ti = {_sess.Ti:0.00} s\n" +
                         $"Td = {_sess.Td:0.0000} s\n" +
-                        $"Fit (RMSE) = {_sess.FitRmse:0.0000}";
+                        $"Fit (RMSE) = {_sess.FitRmse:0.0000}" +
+                        altLine;
 
                     // ── PI(외부) × PD(내부) 분해 ──
                     // Ti_o + Td_i = Ti,  Ti_o * Td_i = Ti * Td
@@ -1213,45 +1242,89 @@ namespace PIDAutoTuner
             _s.SettlingTimeTs = (float)bestTs;
             VrftResult vrft = bestResult;
 
-            // 식별 우선순위: PEM (PBSID-opt + GN, 폐루프 무편향, CRLB 도달) → N4SID → VRFT
-            double finalKp, finalTi, finalTd;
-            string method;
+            // PEM + VRFT 둘 다 계산. PEM 신뢰도에 따라 자동 선택, 다른 쪽은 대안으로 보존.
+            //   identRatio = innovation RMS / std(y)  (낮을수록 모델 신뢰 ↑)
+            //   < 0.3 : PEM 을 주력으로 사용, VRFT 를 대안으로 보존
+            //   ≥ 0.3 또는 PEM 실패 : VRFT 를 주력으로 사용, PEM 을 대안으로 (성공했으면)
+            const double IDENT_THRESHOLD = 0.3;
+
+            bool pemOk = false;
+            ModelPidResult pemResult = default;
+            string pemInfo = "";
             try
             {
-                ModelPidResult pem = ComputePemPid(u, y, dt);
-                finalKp = pem.Kp; finalTi = pem.Ti; finalTd = pem.Td;
-                method = pem.ModelInfo;
+                pemResult = ComputePemPid(u, y, dt);
+                pemOk = true;
+                pemInfo = pemResult.ModelInfo;
             }
-            catch
+            catch (Exception ex)
             {
-                try
+                pemInfo = $"PEM failed: {ex.Message}";
+            }
+
+            string vrftInfo = $"VRFT Ts={bestTs:0.00} rmse={vrft.Rmse:0.00e0}";
+
+            // 자동 선택 로직
+            string primaryName, primaryInfo;
+            double primaryKp, primaryTi, primaryTd;
+            string altName, altInfo;
+            double altKp, altTi, altTd;
+            bool hasAlt;
+
+            if (pemOk && !double.IsNaN(pemResult.IdentRatio) && pemResult.IdentRatio < IDENT_THRESHOLD)
+            {
+                // PEM 신뢰 → 주력
+                primaryName = "PEM";
+                primaryInfo = pemInfo;
+                primaryKp = pemResult.Kp; primaryTi = pemResult.Ti; primaryTd = pemResult.Td;
+                altName = "VRFT"; altInfo = vrftInfo;
+                altKp = vrft.Kp; altTi = vrft.Ti; altTd = vrft.Td;
+                hasAlt = true;
+            }
+            else
+            {
+                // PEM 실패 또는 불신뢰 → VRFT 주력
+                primaryName = "VRFT";
+                primaryInfo = vrftInfo + (pemOk ? $" (PEM ident={pemResult.IdentRatio:0.00} > {IDENT_THRESHOLD} 불신뢰)" : $" ({pemInfo})");
+                primaryKp = vrft.Kp; primaryTi = vrft.Ti; primaryTd = vrft.Td;
+                if (pemOk)
                 {
-                    double[][] otherU = new double[_sess.OtherU.Count][];
-                    for (int ai = 0; ai < _sess.OtherU.Count; ai++)
-                    {
-                        otherU[ai] = new double[blkLen];
-                        if (_sess.OtherU[ai].Count >= blkStart + blkLen)
-                            _sess.OtherU[ai].CopyTo(blkStart, otherU[ai], 0, blkLen);
-                    }
-                    ModelPidResult mr = ComputeModelPid(u, y, dt, otherU);
-                    finalKp = mr.Kp; finalTi = mr.Ti; finalTd = mr.Td;
-                    method = "(PEM failed) " + mr.ModelInfo;
+                    altName = "PEM"; altInfo = pemInfo;
+                    altKp = pemResult.Kp; altTi = pemResult.Ti; altTd = pemResult.Td;
+                    hasAlt = true;
                 }
-                catch
+                else
                 {
-                    finalKp = vrft.Kp; finalTi = vrft.Ti; finalTd = vrft.Td;
-                    method = $"VRFT (PEM+N4SID failed) Ts={bestTs:0.00}";
+                    altName = ""; altInfo = ""; altKp = altTi = altTd = 0;
+                    hasAlt = false;
                 }
             }
 
             _sess.HasResult = true;
-            _sess.Kp = finalKp;
-            _sess.Ti = finalTi;
-            _sess.Td = finalTd;
+            _sess.Kp = primaryKp; _sess.Ti = primaryTi; _sess.Td = primaryTd;
+            _sess.ActiveMethodName = primaryName;
+            _sess.ActiveMethodInfo = primaryInfo;
+            _sess.HasAlt = hasAlt;
+            _sess.AltKp = altKp; _sess.AltTi = altTi; _sess.AltTd = altTd;
+            _sess.AltMethodName = altName; _sess.AltMethodInfo = altInfo;
             _sess.FitRmse = vrft.Rmse;
 
             _autoState = AutoTuneState.Done;
-            _sess.LastMessage = $"Done | {method} → Kp={finalKp:0.000} Ti={finalTi:0.1} Td={finalTd:0.00}";
+            string swapHint = hasAlt ? $" | alt {altName}: Kp={altKp:0.000} Ti={altTi:0.1} Td={altTd:0.00}" : "";
+            _sess.LastMessage = $"Done | {primaryName}: Kp={primaryKp:0.000} Ti={primaryTi:0.1} Td={primaryTd:0.00}{swapHint}";
+        }
+
+        /// <summary>주 결과와 대안 결과를 swap (사용자가 다른 방법 결과를 보고 싶을 때).</summary>
+        private void SwapPidMethod()
+        {
+            if (!_sess.HasResult || !_sess.HasAlt) return;
+            double k = _sess.Kp, i = _sess.Ti, d = _sess.Td;
+            string n = _sess.ActiveMethodName, info = _sess.ActiveMethodInfo;
+            _sess.Kp = _sess.AltKp; _sess.Ti = _sess.AltTi; _sess.Td = _sess.AltTd;
+            _sess.ActiveMethodName = _sess.AltMethodName; _sess.ActiveMethodInfo = _sess.AltMethodInfo;
+            _sess.AltKp = k; _sess.AltTi = i; _sess.AltTd = d;
+            _sess.AltMethodName = n; _sess.AltMethodInfo = info;
+            _sess.LastMessage = $"Swapped → {_sess.ActiveMethodName}: Kp={_sess.Kp:0.000} Ti={_sess.Ti:0.1} Td={_sess.Td:0.00}";
         }
 
         private void CaptureSetPointAdjustBase()
@@ -1712,6 +1785,7 @@ namespace PIDAutoTuner
         {
             public double Kp, Ti, Td;
             public string ModelInfo;
+            public double IdentRatio;  // innovation RMS / std(y) — 낮을수록 모델 신뢰 ↑ (PEM만)
         }
 
         private static ModelPidResult ComputeModelPid(double[] u, double[] y, double dt, double[][] otherU = null)
@@ -2225,10 +2299,13 @@ namespace PIDAutoTuner
             double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(globalBest[1])));
             double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(globalBest[2])));
 
-            string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
-            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} cost={globalBestCost:0.000}";
+            // 식별 신뢰도: innovation RMS / std(y). 0에 가까울수록 모델이 y를 잘 설명.
+            double identRatio = (stdY > 1e-10) ? (refined.InnovationRms / stdY) : double.NaN;
 
-            return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info };
+            string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
+            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} ident={identRatio:0.00} cost={globalBestCost:0.000}";
+
+            return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info, IdentRatio = identRatio };
         }
 
         // ============================================================

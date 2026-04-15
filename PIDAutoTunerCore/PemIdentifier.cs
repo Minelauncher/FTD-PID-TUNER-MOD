@@ -36,6 +36,7 @@ namespace PIDAutoTuner
             public double D;
             public Matrix<double> K = MB.Dense(1, 1);
             public string Info = "";
+            public double InnovationRms;  // √(V(θ)) = 예측오차 RMS. 신뢰도 지표.
         }
 
         // ============================================================
@@ -281,6 +282,7 @@ namespace PIDAutoTuner
 
             var result = new Model { Order = n };
             UnpackTheta(theta, result, n);
+            result.InnovationRms = Math.Sqrt(Math.Max(0, prevCost));
             result.Info = $"PEM n={n} D={result.D:0.000} cost={prevCost:0.4e} (init {initCost:0.4e})";
             return result;
         }

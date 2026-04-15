@@ -177,7 +177,6 @@ namespace PIDAutoTuner
         private enum AutoTuneState
         {
             Idle,       // 대기 중
-            Desaturating, // 포화 해소 중 (Kp 자동 감소)
             Recording,  // 데이터 수집 중 (폐루프)
             Computing,  // 수집 끝, VRFT 계산 중
             Done,       // 계산 완료 (결과 있음)
@@ -258,10 +257,6 @@ namespace PIDAutoTuner
             public int AdaptiveBoostCount;       // 진폭 증가 횟수
             public double LastU;                 // 마지막 제어 출력 (포화 회피용)
             public double NaturalYStd;           // 가진 전 자연 변동 (y의 std)
-            public float OriginalKp;             // 포화 해소 전 원래 Kp
-            public int DesatCheckCount;          // 포화 해소 체크 틱 수
-            public int DesatSatCount;            // 포화 해소 중 포화 틱 수
-            public int DesatAttempts;            // 포화 해소 시도 횟수 (무한 루프 방지)
 
             public bool HasResult;
             public double Kp, Ti, Td;
@@ -289,10 +284,6 @@ namespace PIDAutoTuner
                 AdaptiveBoostCount = 0;
                 LastU = 0;
                 NaturalYStd = 0;
-                OriginalKp = 0;
-                DesatCheckCount = 0;
-                DesatSatCount = 0;
-                DesatAttempts = 0;
                 HasResult = false;
                 Kp = Ti = Td = FitRmse = 0;
                 LastMessage = "";
@@ -511,47 +502,6 @@ namespace PIDAutoTuner
                     return;
                 }
 
-                // 포화 해소 상태: 1초간 포화율 측정 → 높으면 Kp 감소 → 반복
-                if (_autoState == AutoTuneState.Desaturating)
-                {
-                    IVariableController cDesat = this._focus.GetCurrentController();
-                    if (cDesat != null)
-                    {
-                        double absU = Math.Abs(cDesat.LastControlVariable);
-                        _sess.DesatCheckCount++;
-                        if (absU >= _s.SaturationThreshold) _sess.DesatSatCount++;
-
-                        // 50틱(~1초) 마다 판정
-                        if (_sess.DesatCheckCount >= 50)
-                        {
-                            double satRate = (double)_sess.DesatSatCount / _sess.DesatCheckCount;
-
-                            if (satRate < 0.1)
-                            {
-                                // 포화 충분히 낮음 → 녹화 시작
-                                StartAutoTuneRecording();
-                            }
-                            else if (this._focus.Pid.kP.Us > 0.001f && _sess.DesatAttempts < 10)
-                            {
-                                // 포화 높음 → Kp를 절반으로 + 적분 리셋
-                                float newKp = this._focus.Pid.kP.Us * 0.5f;
-                                this._focus.Pid.kP.Us = Math.Max(0.001f, newKp);
-                                this._focus.Pid.SetState(0f, 0f, -1f, 0f);
-                                _sess.DesatAttempts++;
-                                _sess.LastMessage = $"Reducing Kp to {this._focus.Pid.kP.Us:0.000} (sat={satRate:P0}) / Kp를 {this._focus.Pid.kP.Us:0.000}으로 감소 (포화={satRate:P0})";
-                                _sess.DesatCheckCount = 0;
-                                _sess.DesatSatCount = 0;
-                            }
-                            else
-                            {
-                                // Kp를 더 줄일 수 없거나 시도 횟수 초과 → 그냥 시작
-                                StartAutoTuneRecording();
-                            }
-                        }
-                    }
-                    return;
-                }
-
                 // 자동 튜닝 Computing 상태 처리 (녹화 중지 후 다음 틱)
                 if (_autoState == AutoTuneState.Computing)
                 {
@@ -681,20 +631,10 @@ namespace PIDAutoTuner
                         _autoState = AutoTuneState.Computing;
                         _sess.LastMessage = "Auto-tune: analyzing... / 자동 튜닝: 데이터 분석 중...";
                     }
-                    // 블록이 3개 이상 쪼개졌으면 → 포화가 반복됨 → Kp 줄이고 적분 리셋 후 재시작
-                    else if (_sess.BlockStarts.Count >= 3 && this._focus.Pid.kP.Us > 0.001f && _sess.DesatAttempts < 10)
+                    // 블록 분리가 많으면 경고만 표시 (Kp는 건드리지 않음)
+                    else if (_sess.BlockStarts.Count >= 5)
                     {
-                        StopRecording();
-                        float newKp = this._focus.Pid.kP.Us * 0.5f;
-                        this._focus.Pid.kP.Us = Math.Max(0.001f, newKp);
-                        // 적분 누적 리셋
-                        this._focus.Pid.SetState(0f, 0f, -1f, 0f);
-                        _sess.DesatAttempts++;
-                        _sess.LastMessage = $"Too many blocks. Reducing Kp to {this._focus.Pid.kP.Us:0.000} / 블록 분리 과다. Kp를 {this._focus.Pid.kP.Us:0.000}으로 감소";
-                        _sess.Clear();
-                        _autoState = AutoTuneState.Desaturating;
-                        _sess.DesatCheckCount = 0;
-                        _sess.DesatSatCount = 0;
+                        _sess.LastMessage = $"Many block splits ({_sess.BlockStarts.Count}). Data may be noisy. / 블록 분리 다수 ({_sess.BlockStarts.Count}). 데이터 품질 주의.";
                     }
                 }
             }
@@ -724,8 +664,8 @@ namespace PIDAutoTuner
                     string rec;
                     if (_sess.Recording)
                         rec = "Recording / 녹화중";
-                    else if (_autoState == AutoTuneState.Desaturating)
-                        rec = "Desaturating / 포화 해소 중";
+                    else if (_autoState == AutoTuneState.OpenLoop)
+                        rec = "Step ID / 스텝 식별 중";
                     else
                         rec = "Idle / 대기";
                     double dt = Time.fixedDeltaTime;
@@ -1024,7 +964,7 @@ namespace PIDAutoTuner
         /// </summary>
         private void AutoTuneNow()
         {
-            if (_autoState == AutoTuneState.Recording || _autoState == AutoTuneState.Desaturating)
+            if (_autoState == AutoTuneState.Recording)
             {
                 _sess.LastMessage = "Auto-tune already in progress / 자동 튜닝 이미 진행 중";
                 return;
@@ -1032,15 +972,8 @@ namespace PIDAutoTuner
 
             RestoreSetPointAdjustIfNeeded();
 
-            // 원래 Kp 백업
-            _sess.OriginalKp = this._focus.Pid.kP.Us;
-            _sess.DesatCheckCount = 0;
-            _sess.DesatSatCount = 0;
-            _sess.DesatAttempts = 0;
-
-            // 먼저 포화 해소 단계로 진입 (1초간 포화율 측정)
-            _autoState = AutoTuneState.Desaturating;
-            _sess.LastMessage = "Checking saturation... / 포화 확인 중...";
+            // 바로 녹화 시작 (Desaturation 제거 — VRFT는 기존 제어기와 무관)
+            StartAutoTuneRecording();
         }
 
         /// <summary>

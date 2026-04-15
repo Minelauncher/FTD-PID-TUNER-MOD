@@ -186,6 +186,13 @@ namespace PIDAutoTuner
             OpenLoop    // 개루프 스텝 응답 수집 중
         }
 
+        /// <summary>축 타입 — 사용자가 각 tab 에서 지정. 피치 고도유지 로직 등에 사용.</summary>
+        public enum AxisType
+        {
+            Unspecified,  // 미지정 (기본값)
+            Yaw, Roll, Pitch, Hover, Forward, Strafe
+        }
+
         // ■ sealed class = 상속 불가 클래스. "이 클래스를 더 확장하지 않겠다"는 의미.
         //   private = VrftTuningTab 안에서만 사용.
         //   Settings는 UI 슬라이더와 연결되는 "설정값 묶음".
@@ -224,6 +231,9 @@ namespace PIDAutoTuner
 
             // ===== 축 분리 (Axis Fixture) =====
             public bool FixOtherAxes = true;        // 튜닝 중 다른 축 SP 고정
+            public AxisType AxisKind = AxisType.Unspecified;  // 이 탭의 축 타입
+            public float PitchAltHoldGain = 0.01f;  // 고도 오차 (m) → 피치 SP 오프셋 스케일
+            public float PitchAltHoldClamp = 0.3f;  // 피치 SP 오프셋 최대 크기
         }
 
         /// <summary>
@@ -349,6 +359,16 @@ namespace PIDAutoTuner
             = new Dictionary<VariableControllerMaster, VrftTuningTab>();
         private readonly Dictionary<VariableControllerMaster, float> _frozenOtherSPs
             = new Dictionary<VariableControllerMaster, float>();
+
+        // ── 피치 고도 유지 (Pitch Altitude Hold) ──
+        // 비행기형 기체는 피치를 고도 제어에 사용 → 튜닝 중 피치 SP 를 고정하면 고도 드리프트.
+        // 해결: Hover 축이 등록되어 있으면 그 PV 를 고도 기준으로 사용, 피치 SP 에 실시간 offset 주입.
+        //   pitchOffset = clamp(K_alt · (startAlt - currentAlt), ±clampMax)
+        // 가진 0.05~2Hz vs 고도 루프 ~0.01Hz → 대역 분리 → 피치 SISO 데이터 깨끗.
+        private VariableControllerMaster _altitudeSourceAxis;  // Hover 로 지정된 축 (PV=고도)
+        private VariableControllerMaster _pitchTargetAxis;     // Pitch 로 지정된 축 (SP 받음)
+        private bool _altHoldActive;
+        private double _altHoldStartAltitude;
 
         // 가진 적용 시 원래 SetPoint를 백업해두고, 녹화 끝나면 복원하기 위한 변수.
         // SetPointAdjust = FTD에서 PID의 목표값을 외부에서 조절하는 파라미터.
@@ -838,13 +858,35 @@ namespace PIDAutoTuner
                 "excite"
             ));
 
+            // Axis type 선택 (cycle 버튼)
+            seg.AddInterpretter(MakeCycleButton(
+                "Axis type / 축 타입",
+                "Mark this tab's axis so cross-axis features work correctly.\n" +
+                "Hover axis's PV = altitude (used for pitch altitude-hold).\n" +
+                "Pitch axis receives altitude-hold offset.\n" +
+                "Open each axis's PID UI once and set its type.\n---\n" +
+                "이 탭의 축 타입 지정. 축간 기능 (피치 고도유지) 에 필요.\n" +
+                "Hover 축의 PV = 고도, Pitch 축 SP 에 고도 보정 주입.\n" +
+                "튜닝 전 각 축 PID UI 열고 타입 설정.",
+                () => _s.AxisKind.ToString(),
+                () =>
+                {
+                    // 순환: Unspecified → Yaw → Roll → Pitch → Hover → Forward → Strafe → Unspecified
+                    _s.AxisKind = (AxisType)(((int)_s.AxisKind + 1) % Enum.GetValues(typeof(AxisType)).Length);
+                },
+                "axistype"
+            ));
+
             seg.AddInterpretter(MakeToggle(
                 "Fix other axes / 다른 축 고정",
                 "During tuning, other axes' SetPoints are frozen at captured values\n" +
                 "so existing PIDs hold attitude/altitude. Open each axis's PID UI\n" +
-                "once before tuning to register it.\n---\n" +
+                "once before tuning to register it.\n" +
+                "If Hover + Pitch axes both tagged, Pitch SP receives altitude-hold\n" +
+                "offset via Hover's PV (for airplane-style altitude control).\n---\n" +
                 "튜닝 중 다른 축 SP를 캡처 값에 고정 → 기존 PID가 자세/고도 유지.\n" +
-                "튜닝 전 각 축 PID UI를 한 번씩 열어 등록 필요.",
+                "튜닝 전 각 축 PID UI를 한 번씩 열어 등록 필요.\n" +
+                "Hover + Pitch 모두 태그되면 Hover PV로 피치 SP에 고도 보정 주입.",
                 () => _s.FixOtherAxes,
                 b => _s.FixOtherAxes = b,
                 "fixaxes"
@@ -1093,36 +1135,105 @@ namespace PIDAutoTuner
         /// <summary>
         /// 튜닝 시작 시 호출. 현재 등록된 모든 다른 축의 SP 를 캡처.
         /// Recording 중 매 틱 ApplyOtherAxesFixture() 가 이 값으로 재적용.
+        /// 동시에 피치 고도 유지용 Hover/Pitch 축 식별 + 시작 고도 캡처.
         /// </summary>
         private void CaptureOtherAxesFixture()
         {
             _frozenOtherSPs.Clear();
+            _altitudeSourceAxis = null;
+            _pitchTargetAxis = null;
+            _altHoldActive = false;
+
             if (!_s.FixOtherAxes) return;
 
+            // 등록된 축 중에서 Hover / Pitch 식별 (AxisKind 로)
             foreach (var kv in _tabsByAxis)
             {
                 VariableControllerMaster axis = kv.Key;
-                if (axis == null || axis == this._focus) continue;
+                if (axis == null) continue;
+                try
+                {
+                    var axisTab = kv.Value;
+                    if (axisTab != null && axisTab._s != null)
+                    {
+                        if (axisTab._s.AxisKind == AxisType.Hover) _altitudeSourceAxis = axis;
+                        else if (axisTab._s.AxisKind == AxisType.Pitch) _pitchTargetAxis = axis;
+                    }
+                }
+                catch { }
+
+                // 다른 축 SP 캡처 (현재 축 제외)
+                if (axis == this._focus) continue;
                 try { _frozenOtherSPs[axis] = axis.SetPointAdjust.Us; }
+                catch { }
+            }
+
+            // 고도 유지 활성 조건: Hover 축 + Pitch 축 모두 등록됨 + Hover PV 읽기 성공
+            if (_altitudeSourceAxis != null && _pitchTargetAxis != null)
+            {
+                try
+                {
+                    var hoverCtrl = _altitudeSourceAxis.GetCurrentController();
+                    if (hoverCtrl != null)
+                    {
+                        _altHoldStartAltitude = hoverCtrl.LastProcessVariable;
+                        _altHoldActive = true;
+                    }
+                }
                 catch { }
             }
         }
 
-        /// <summary>매 틱 호출. 다른 축 SP 를 freeze 값으로 재적용. 기존 PID 가 이 SP 추종.</summary>
+        /// <summary>
+        /// 매 틱 호출.
+        ///   1. 다른 축 (피치 제외) SP 를 freeze 값으로 재적용
+        ///   2. 피치 축: 고도 유지 offset 계산 후 SP 주입
+        ///      - 피치가 튜닝 대상이면 excitation + offset
+        ///      - 피치가 대상 아니면 offset 만
+        /// </summary>
         private void ApplyOtherAxesFixture()
         {
-            if (_frozenOtherSPs.Count == 0) return;
+            // 1. 일반 freeze (피치는 제외 — 아래에서 특수 처리)
             foreach (var kv in _frozenOtherSPs)
             {
+                if (_altHoldActive && kv.Key == _pitchTargetAxis) continue;  // 피치는 별도
                 try { kv.Key.SetPointAdjust.Us = kv.Value; }
                 catch { }
             }
+
+            // 2. 피치 고도 유지 — Hover PV 로 고도 오차 → 피치 SP offset
+            if (!_altHoldActive || _pitchTargetAxis == null || _altitudeSourceAxis == null) return;
+            try
+            {
+                var hoverCtrl = _altitudeSourceAxis.GetCurrentController();
+                if (hoverCtrl == null) return;
+                double currentAlt = hoverCtrl.LastProcessVariable;
+                double altErr = _altHoldStartAltitude - currentAlt;
+                double clampMax = _s.PitchAltHoldClamp;
+                double offset = Math.Max(-clampMax, Math.Min(clampMax, _s.PitchAltHoldGain * altErr));
+
+                if (_pitchTargetAxis == this._focus)
+                {
+                    // 피치가 튜닝 대상: excitation 위에 offset 더함
+                    // ApplyExcitation 가 이미 SP = base + excitation 설정. offset 을 SP 에 더함.
+                    _pitchTargetAxis.SetPointAdjust.Us += (float)offset;
+                }
+                else
+                {
+                    // 피치 고정 (다른 축 튜닝 중): freeze 값 대신 offset 직접 설정
+                    _pitchTargetAxis.SetPointAdjust.Us = (float)offset;
+                }
+            }
+            catch { }
         }
 
         /// <summary>튜닝 종료 시. freeze 해제 — 다른 축 SP 가 다시 AI 에 의해 제어됨.</summary>
         private void ReleaseOtherAxesFixture()
         {
             _frozenOtherSPs.Clear();
+            _altHoldActive = false;
+            _altitudeSourceAxis = null;
+            _pitchTargetAxis = null;
         }
 
         // ============================================================

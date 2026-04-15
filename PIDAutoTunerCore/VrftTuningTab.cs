@@ -1479,7 +1479,7 @@ namespace PIDAutoTuner
                 // 최소 단위 반영
                 double kp = RoundToStep(Math.Max(0.001, _sess.Kp), 0.001);
                 double ti = RoundToStep(Math.Max(0.0, _sess.Ti), 0.1);
-                double td = RoundToStep(Math.Max(0.0, _sess.Td), 0.1);
+                double td = RoundToStep(Math.Max(0.0, _sess.Td), 0.01);
 
                 // 게임 UI 관례 (kI가 250이면 off처럼 쓰는 경우가 많음)
                 if (ti > 250.0) ti = 250.0;
@@ -1489,7 +1489,7 @@ namespace PIDAutoTuner
                 this._focus.Pid.kI.Us = (float)ti; // Ti
                 this._focus.Pid.kD.Us = (float)td; // Td
 
-                _sess.LastMessage = $"Applied: Kp={kp:0.000}, Ti={ti:0.0}, Td={td:0.0}";
+                _sess.LastMessage = $"Applied: Kp={kp:0.000}, Ti={ti:0.0}, Td={td:0.00}";
             }
             catch (Exception e)
             {
@@ -1982,7 +1982,7 @@ namespace PIDAutoTuner
             {
                 if (Math.Abs(Hf[i].Real) > hMax * 0.05)
                 {
-                    tauDelay = Math.Max(0, (i - 1)) * dt;
+                    tauDelay = i * dt; // 첫 유의미한 반응 시점이 순수 지연
                     break;
                 }
             }

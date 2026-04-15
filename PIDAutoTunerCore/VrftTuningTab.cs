@@ -1714,224 +1714,256 @@ namespace PIDAutoTuner
 
         private static ModelPidResult ComputeModelPid(double[] u, double[] y, double dt, double[][] otherU = null)
         {
+            _ = otherU; // MISO 확장용 예약 (현재 SISO)
             int N = Math.Min(u.Length, y.Length);
             if (N < 100) throw new Exception("Too few samples for N4SID");
 
-            // ── 1. 디트렌드 ──
+            // ── 1. 디트렌드 (DC + 선형 추세 제거) ──
             double[] ud = new double[N]; Array.Copy(u, ud, N); Detrend(ud);
             double[] yd = new double[N]; Array.Copy(y, yd, N); Detrend(yd);
 
-            // ── 2. 블록 Hankel 행렬 구성 ──
-            // 블록 행 수 L, 열 수 j
-            int L = Math.Min(20, N / 6);
-            int j = N - 2 * L + 1;
-            if (j < 20) throw new Exception("Insufficient columns");
+            // ── 2. 블록 Hankel 행렬 (균형 과거/미래 horizon i) ──
+            int iHor = Math.Min(20, (N - 1) / 4);
+            if (iHor < 4) throw new Exception("Horizon too small");
+            int j = N - 2 * iHor + 1;
+            if (j < 2 * iHor + 10) throw new Exception("Insufficient columns for N4SID");
 
-            // U_p, U_f: L × j (SISO, 자기축만)
-            var Up = MB.Dense(L, j);
-            var Uf = MB.Dense(L, j);
-            var Yp = MB.Dense(L, j);
-            var Yf = MB.Dense(L, j);
-
+            var Up = MB.Dense(iHor, j);
+            var Uf = MB.Dense(iHor, j);
+            var Yp = MB.Dense(iHor, j);
+            var Yf = MB.Dense(iHor, j);
             for (int col = 0; col < j; col++)
-            {
-                for (int row = 0; row < L; row++)
+                for (int row = 0; row < iHor; row++)
                 {
                     Up[row, col] = ud[col + row];
-                    Uf[row, col] = ud[col + L + row];
                     Yp[row, col] = yd[col + row];
-                    Yf[row, col] = yd[col + L + row];
+                    Uf[row, col] = ud[col + iHor + row];
+                    Yf[row, col] = yd[col + iHor + row];
                 }
-            }
 
-            // ── 3. 경사 투영: Yf에서 Uf 영향 제거 ──
-            // O_i = Yf * Π_Uf^⊥ = Yf - Yf * Uf^T * (Uf*Uf^T)^-1 * Uf
-            var UfUfT = Uf * Uf.Transpose();
-            Matrix<double> YfPerp;
-            try
+            // 과거 입출력 결합 W_p = [U_p; Y_p] (2i × j) — 상태 재구성용
+            var Wp = MB.Dense(2 * iHor, j);
+            for (int row = 0; row < iHor; row++)
+                for (int col = 0; col < j; col++)
+                {
+                    Wp[row, col] = Up[row, col];
+                    Wp[row + iHor, col] = Yp[row, col];
+                }
+
+            // ── 3. 경사 투영 O_i = Y_f /_{U_f} W_p ──
+            // 원리 (Van Overschee 1994): U_f 방향을 따라 W_p 행공간에 Y_f를 투영.
+            // 공식: O_i = Y_f · Π_{U_f^⊥} · (W_p · Π_{U_f^⊥})^† · W_p
+            //   Π_{U_f^⊥} = I - U_f^T (U_f U_f^T)^{-1} U_f  (U_f 직교여집합 투영)
+            // wide matrix의 pinv: pinv(X) = X^T (X X^T)^{-1}
+            Matrix<double> ObliqueProject(Matrix<double> YfA, Matrix<double> UfA, Matrix<double> WpA)
             {
-                var UfProj = UfUfT.Solve(Uf);
-                YfPerp = Yf - Yf * Uf.Transpose() * UfProj;
+                var UU = UfA * UfA.Transpose();                   // i × i
+                var UU_inv_Uf = UU.Solve(UfA);                    // (U U^T)^-1 · U
+                var UfT = UfA.Transpose();
+                var YfPerp = YfA - YfA * UfT * UU_inv_Uf;         // Y_f · Π⊥
+                var WpPerp = WpA - WpA * UfT * UU_inv_Uf;         // W_p · Π⊥
+                // Coeff = Y_f · Π⊥ · W_p · Π⊥^T · (W_p · Π⊥ · W_p · Π⊥^T)^{-1}
+                var WW = WpPerp * WpPerp.Transpose();             // 2i × 2i
+                var YW = YfPerp * WpPerp.Transpose();             // i × 2i
+                var Coeff = WW.Solve(YW.Transpose()).Transpose(); // i × 2i
+                return Coeff * WpA;                               // i × j
             }
-            catch { YfPerp = Yf; }
 
-            // ── 4. SVD로 시스템 차수 결정 ──
-            var svd = YfPerp.Svd();
+            var Oi = ObliqueProject(Yf, Uf, Wp);
+
+            // ── 4. SVD + Gavish-Donoho 최적 차수 선택 ──
+            // 직사각 행렬 (m × n, m=i, n=j) β = min(m,n)/max(m,n):
+            //   ω(β) = √( 2(β+1) + 8β / ((β+1) + √(β² + 14β + 1)) )
+            //   τ = ω(β) · σ_median  (unknown noise level)
+            var svd = Oi.Svd();
             var sigma = svd.S;
+            int svCnt = sigma.Count;
+            double[] sigSorted = new double[svCnt];
+            for (int k = 0; k < svCnt; k++) sigSorted[k] = sigma[k];
+            Array.Sort(sigSorted);
+            double sigMedian = sigSorted[sigSorted.Length / 2];
+            double beta = (double)Math.Min(iHor, j) / Math.Max(iHor, j);
+            double omegaGD = Math.Sqrt(2 * (beta + 1) + 8 * beta /
+                              ((beta + 1) + Math.Sqrt(beta * beta + 14 * beta + 1)));
+            double gdThreshold = omegaGD * sigMedian;
 
-            // Gavish-Donoho 임계값
-            double[] sigArr = new double[sigma.Count];
-            for (int i = 0; i < sigma.Count; i++) sigArr[i] = sigma[i];
-            Array.Sort(sigArr);
-            double sigMedian = sigArr[sigArr.Length / 2];
-            double gdThreshold = (4.0 / Math.Sqrt(3.0)) * sigMedian;
-
-            int maxOrder = Math.Min(4, sigma.Count);
+            int maxOrder = Math.Min(4, svCnt);
             int order = 1;
-            for (int i = 1; i < maxOrder; i++)
+            for (int k = 0; k < maxOrder; k++)
             {
-                if (sigma[i] < gdThreshold) break;
-                order = i + 1;
+                if (sigma[k] < gdThreshold) break;
+                order = k + 1;
             }
 
-            // ── 5. 확장 관측성 행렬 Γ와 상태 시퀀스 X ──
-            // Γ = U_svd(:,1:n) * Σ_n^(1/2) ,  X = Γ^† * Yf (의사역행렬)
-            var Un = svd.U.SubMatrix(0, L, 0, order);
+            // ── 5. 확장 관측성 행렬 Γ_i = U_n · Σ_n^{1/2}  (i × n) ──
+            var Un = svd.U.SubMatrix(0, iHor, 0, order);
             var SigmaHalf = MB.DiagonalOfDiagonalArray(order, order,
-                Enumerable.Range(0, order).Select(i => Math.Sqrt(sigma[i])).ToArray());
-            var Gamma = Un * SigmaHalf;
+                Enumerable.Range(0, order).Select(k => Math.Sqrt(sigma[k])).ToArray());
+            var Gamma_i = Un * SigmaHalf;
 
-            // 상태: X = Γ^† * Yf (j 개의 상태 샘플)
-            // pseudo-inverse of Gamma (L×n)
-            // Γ^† = (Γ^T Γ)^-1 Γ^T
-            var GammaT = Gamma.Transpose();
-            Matrix<double> X;
-            try
-            {
-                X = (GammaT * Gamma).Inverse() * GammaT * Yf;
-            }
+            // ── 6. 상태 시퀀스 X_i = Γ_i^† · O_i  (n × j) ──
+            var GT = Gamma_i.Transpose();
+            Matrix<double> X_i;
+            try { X_i = (GT * Gamma_i).Inverse() * GT * Oi; }
             catch { throw new Exception("Gamma pseudo-inverse failed"); }
 
-            // ── 6. A, B, C, D 최소자승 추출 ──
-            // [X(:, 2:j);     [A B]   [X(:, 1:j-1)]
-            //  Yf(1, 1:j-1)] = [C D] * [Uf(1, 1:j-1)]
-            // LS: M * P = Q → M = Q * P^T * (P*P^T)^-1
-            if (j < 3) throw new Exception("Insufficient columns for LS");
-
-            var X1 = X.SubMatrix(0, order, 0, j - 1);        // n × (j-1)
-            var X2 = X.SubMatrix(0, order, 1, j - 1);        // n × (j-1)
-            // Yf(0, 0:j-2), Uf(0, 0:j-2) 모두 1 × (j-1)
-            var Yf_row = Yf.SubMatrix(0, 1, 0, j - 1);
-            var Uf_row = Uf.SubMatrix(0, 1, 0, j - 1);
-
-            // P = [X1; Uf_row] → (n+1) × (j-1)
-            var P = MB.Dense(order + 1, j - 1);
-            for (int i = 0; i < order; i++)
-                for (int c = 0; c < j - 1; c++)
-                    P[i, c] = X1[i, c];
-            for (int c = 0; c < j - 1; c++)
-                P[order, c] = Uf_row[0, c];
-
-            // Q = [X2; Yf_row] → (n+1) × (j-1)
-            var Q = MB.Dense(order + 1, j - 1);
-            for (int i = 0; i < order; i++)
-                for (int c = 0; c < j - 1; c++)
-                    Q[i, c] = X2[i, c];
-            for (int c = 0; c < j - 1; c++)
-                Q[order, c] = Yf_row[0, c];
-
-            // M = Q * P^T * (P * P^T)^-1
-            Matrix<double> M_mat;
-            try
+            // ── 7. 이동(shifted) 경사 투영 → X_{i+1} 재구성 ──
+            // Y_f^- = Y_f(2:i, :)   (i-1) × j
+            // U_f^- = U_f(2:i, :)   (i-1) × j
+            // W_p^+ = [U_p; Uf(1,:); Y_p; Yf(1,:)]  2(i+1) × j
+            var Yfm = Yf.SubMatrix(1, iHor - 1, 0, j);
+            var Ufm = Uf.SubMatrix(1, iHor - 1, 0, j);
+            var Wpp = MB.Dense(2 * (iHor + 1), j);
+            for (int row = 0; row < iHor; row++)
+                for (int col = 0; col < j; col++)
+                {
+                    Wpp[row, col] = Up[row, col];              // 확장된 U_past: 기존 Up
+                    Wpp[row + iHor + 1, col] = Yp[row, col];   // 확장된 Y_past: 기존 Yp
+                }
+            for (int col = 0; col < j; col++)
             {
-                M_mat = Q * P.Transpose() * (P * P.Transpose()).Inverse();
+                Wpp[iHor, col] = Uf[0, col];                   // 확장된 U_past 마지막: Uf 첫 행
+                Wpp[2 * iHor + 1, col] = Yf[0, col];           // 확장된 Y_past 마지막: Yf 첫 행
             }
+            var O_im1 = ObliqueProject(Yfm, Ufm, Wpp);         // (i-1) × j
+
+            // Γ_{i-1} = Γ_i의 마지막 블록행(SISO=1행) 제거 → (i-1) × n
+            var Gamma_im1 = Gamma_i.SubMatrix(0, iHor - 1, 0, order);
+            var GT2 = Gamma_im1.Transpose();
+            Matrix<double> X_ip1;
+            try { X_ip1 = (GT2 * Gamma_im1).Inverse() * GT2 * O_im1; }
+            catch { throw new Exception("Gamma_{i-1} pseudo-inverse failed"); }
+
+            // ── 8. [A B; C D] 최소자승 추출 ──
+            //   [X_{i+1}]   [A B]   [X_i    ]
+            //   [Y_{i|i}] = [C D] · [U_{i|i}]
+            // Θ · P = Q → Θ = Q · P^T · (P P^T)^{-1}
+            var U_ii = Uf.SubMatrix(0, 1, 0, j);  // 1 × j (시점 i의 입력)
+            var Y_ii = Yf.SubMatrix(0, 1, 0, j);  // 1 × j (시점 i의 출력)
+
+            var P = MB.Dense(order + 1, j);
+            for (int r = 0; r < order; r++)
+                for (int c = 0; c < j; c++)
+                    P[r, c] = X_i[r, c];
+            for (int c = 0; c < j; c++) P[order, c] = U_ii[0, c];
+
+            var Q = MB.Dense(order + 1, j);
+            for (int r = 0; r < order; r++)
+                for (int c = 0; c < j; c++)
+                    Q[r, c] = X_ip1[r, c];
+            for (int c = 0; c < j; c++) Q[order, c] = Y_ii[0, c];
+
+            Matrix<double> Theta;
+            try { Theta = Q * P.Transpose() * (P * P.Transpose()).Inverse(); }
             catch { throw new Exception("State-space LS failed"); }
 
-            // A (n×n), B (n×1), C (1×n), D (1×1) 추출
-            var A = M_mat.SubMatrix(0, order, 0, order);
-            var B = M_mat.SubMatrix(0, order, order, 1);
-            var C = M_mat.SubMatrix(order, 1, 0, order);
-            double D_scalar = M_mat[order, order];
+            var A_mat = Theta.SubMatrix(0, order, 0, order);
+            var B_mat = Theta.SubMatrix(0, order, order, 1);
+            var C_mat = Theta.SubMatrix(order, 1, 0, order);
+            double D_sc = Theta[order, order];
 
-            // ── 7. 플랜트 특성 분석 ──
-            var eigenA = A.Evd();
-            bool isIntegrator = false;
+            // ── 9. 모델 분석 (고유값 기반 지배 시상수, DC 이득) ──
+            var eigA = A_mat.Evd();
             double dominantTau = dt;
-            for (int i = 0; i < order; i++)
+            for (int k = 0; k < order; k++)
             {
-                double eigMag = eigenA.EigenValues[i].Magnitude;
-                double eigReal = eigenA.EigenValues[i].Real;
-                if (eigMag > 0.99) isIntegrator = true;
-                if (eigReal > 0 && eigReal < 1.0 && eigMag > 0.5)
-                {
-                    double tau_i = -dt / Math.Log(Math.Max(1e-12, eigMag));
-                    if (tau_i > dominantTau) dominantTau = tau_i;
-                }
+                double eigMag = eigA.EigenValues[k].Magnitude;
+                if (eigMag < 1e-10 || eigMag >= 1.0) continue;
+                double tau_k = -dt / Math.Log(eigMag);
+                if (tau_k > dominantTau) dominantTau = tau_k;
             }
 
-            // DC 게인: G(1) = C*(I-A)^-1*B + D
-            double dcGain = D_scalar;
+            double dcGain;
             try
             {
-                var IA = MB.DenseIdentity(order) - A;
-                var IA_inv_B = IA.Solve(B);
-                for (int i = 0; i < order; i++)
-                    dcGain += C[0, i] * IA_inv_B[i, 0];
+                var IA = MB.DenseIdentity(order) - A_mat;
+                var IA_invB = IA.Solve(B_mat);
+                dcGain = D_sc;
+                for (int k = 0; k < order; k++) dcGain += C_mat[0, k] * IA_invB[k, 0];
             }
-            catch { isIntegrator = true; }
+            catch { dcGain = double.NaN; }
 
-            // ── 8. PID 시뮬레이션 + PSO ──
-            int simLen = 400;
+            // ── 10. PID 시뮬레이션 + PSO 탐색 ──
+            // 상태공간 모델: x(k+1) = A x(k) + B u(k),  y(k) = C x(k) + D u(k)
+            // 실시간 제어기는 샘플 지연 존재 → 1-샘플 지연 측정으로 algebraic loop 해결:
+            //   u(k)는 y(k-1) 기준으로 계산 → D 항이 자연스럽게 반영됨.
+            int simLen = Math.Min(800, Math.Max(200, (int)(6.0 * dominantTau / dt)));
             double targetTs = Math.Max(0.5, 2.0 * dominantTau);
             double tauM = 0.2 * targetTs;
 
             double[] yTarget = new double[simLen];
             for (int k = 0; k < simLen; k++)
             {
-                double t = k * dt;
-                double tm = t / tauM;
+                double tm = k * dt / tauM;
                 yTarget[k] = 1.0 - (1.0 + tm) * Math.Exp(-tm);
             }
 
-            // 상태공간 모델 시뮬레이션 함수
+            // 상태공간 → 단순 배열 캐시 (PSO 루프에서 반복 평가)
+            double[,] Ac = new double[order, order];
+            double[] Bc = new double[order];
+            double[] Cc = new double[order];
+            for (int r = 0; r < order; r++)
+            {
+                for (int c = 0; c < order; c++) Ac[r, c] = A_mat[r, c];
+                Bc[r] = B_mat[r, 0];
+                Cc[r] = C_mat[0, r];
+            }
+            double Dc = D_sc;
+
             Func<double, double, double, double> evaluate = (tryKp, tryTi, tryTd) =>
             {
-                // 상태 초기화
-                var x = MB.Dense(order, 1);
+                double[] x = new double[order];
+                double[] xNext = new double[order];
                 double integ = 0;
                 double prevE = 0;
+                double yMeas = 0;   // 1-샘플 지연 측정값
                 double maxY = 0;
                 double cost = 0;
 
                 for (int k = 0; k < simLen; k++)
                 {
                     double r = 1.0;
-                    // y(k) = C*x(k) + D*u(k-1) — u는 아래에서 계산되므로 D는 이전 u에 적용
-                    // 간소화: y(k) = C*x(k) (D는 작고 직접 전달이라 무시 가능하지만 정확히는 필요)
-                    double y_k = 0;
-                    for (int i = 0; i < order; i++)
-                        y_k += C[0, i] * x[i, 0];
-
-                    double e = r - y_k;
+                    double e = r - yMeas;
                     integ += e * dt;
                     double deriv = (k > 0) ? (e - prevE) / dt : 0;
                     prevE = e;
 
-                    double u_k = tryKp * (e + integ / tryTi + tryTd * deriv);
-                    if (u_k > 1.0) u_k = 1.0;
-                    else if (u_k < -1.0) u_k = -1.0;
+                    double uk = tryKp * (e + integ / tryTi + tryTd * deriv);
+                    if (uk > 1.0) uk = 1.0;
+                    else if (uk < -1.0) uk = -1.0;
 
-                    // x(k+1) = A*x(k) + B*u(k)
-                    var x_next = MB.Dense(order, 1);
-                    for (int i = 0; i < order; i++)
+                    // y(k) = C x(k) + D u(k)
+                    double yk = Dc * uk;
+                    for (int i2 = 0; i2 < order; i2++) yk += Cc[i2] * x[i2];
+
+                    // x(k+1) = A x(k) + B u(k)
+                    for (int i2 = 0; i2 < order; i2++)
                     {
-                        double sum = B[i, 0] * u_k;
-                        for (int ji = 0; ji < order; ji++)
-                            sum += A[i, ji] * x[ji, 0];
-                        x_next[i, 0] = sum;
+                        double s = Bc[i2] * uk;
+                        for (int jj = 0; jj < order; jj++) s += Ac[i2, jj] * x[jj];
+                        xNext[i2] = s;
                     }
-                    x = x_next;
+                    var tmp = x; x = xNext; xNext = tmp;
 
-                    if (double.IsNaN(y_k) || double.IsInfinity(y_k) || Math.Abs(y_k) > 100)
+                    if (double.IsNaN(yk) || double.IsInfinity(yk) || Math.Abs(yk) > 100)
                         return double.MaxValue;
 
-                    double err = yTarget[k] - y_k;
-                    cost += k * dt * Math.Abs(err) * dt;
-                    if (y_k > maxY) maxY = y_k;
-                }
+                    double err = yTarget[k] - yk;
+                    cost += k * dt * Math.Abs(err) * dt;   // ITAE
+                    if (yk > maxY) maxY = yk;
 
-                cost += 10.0 * Math.Max(0, maxY - 1.0);
+                    yMeas = yk; // 다음 스텝에서 제어기가 참조
+                }
+                cost += 10.0 * Math.Max(0, maxY - 1.0);    // 오버슈트 페널티
                 return cost;
             };
 
-            // PSO
+            // PSO (log-공간 탐색)
             const int nParticles = 20;
             const int maxIter = 30;
             const double w_pso = 0.7;
             const double c1 = 1.5;
             const double c2 = 1.5;
-
             double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
             double[] hi = { Math.Log(1.0),   Math.Log(50.0), Math.Log(1.0)   };
 
@@ -1956,11 +1988,7 @@ namespace PIDAutoTuner
                 }
                 double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
                 pBestCost[p] = cost;
-                if (cost < gBestCost)
-                {
-                    gBestCost = cost;
-                    Array.Copy(pos[p], gBest, 3);
-                }
+                if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
             }
 
             for (int it = 0; it < maxIter; it++)
@@ -1983,20 +2011,17 @@ namespace PIDAutoTuner
                     {
                         pBestCost[p] = cost;
                         Array.Copy(pos[p], pBest[p], 3);
-                        if (cost < gBestCost)
-                        {
-                            gBestCost = cost;
-                            Array.Copy(pos[p], gBest, 3);
-                        }
+                        if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
                     }
                 }
             }
 
-            double bestKp = Math.Max(0.001, Math.Min(1.0, Math.Exp(gBest[0])));
-            double bestTi = Math.Max(0.1, Math.Min(250.0, Math.Exp(gBest[1])));
-            double bestTd = Math.Max(0.0, Math.Min(10.0, Math.Exp(gBest[2])));
+            double bestKp = Math.Max(0.001, Math.Min(1.0,   Math.Exp(gBest[0])));
+            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBest[1])));
+            double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBest[2])));
 
-            string modelInfoStr = $"N4SID n={order} DC={dcGain:0.00} τp={dominantTau:0.00} cost={gBestCost:0.000}";
+            string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
+            string modelInfoStr = $"N4SID n={order} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} cost={gBestCost:0.000}";
 
             return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = modelInfoStr };
         }

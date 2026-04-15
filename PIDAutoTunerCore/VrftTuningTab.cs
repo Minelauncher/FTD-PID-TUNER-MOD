@@ -235,7 +235,6 @@ namespace PIDAutoTuner
 
             public readonly List<double> U = new List<double>();  // 제어 출력 기록
             public readonly List<double> Y = new List<double>();  // 프로세스 변수 기록
-            public readonly List<double> R = new List<double>();  // 가진 신호 (외생) — PEM 폐루프 식별용
 
             // MISO N4SID용: 다른 축의 u 기록 (커플링 분리)
             public readonly List<List<double>> OtherU = new List<List<double>>();
@@ -276,7 +275,6 @@ namespace PIDAutoTuner
                 T = 0;
                 U.Clear();
                 Y.Clear();
-                R.Clear();
                 OtherU.Clear();
                 BlockStarts.Clear();
                 BlockStarts.Add(0);
@@ -637,7 +635,6 @@ namespace PIDAutoTuner
 
                 _sess.U.Add(u);
                 _sess.Y.Add(y);
-                _sess.R.Add(_lastExciteValue); // 외생 가진 신호 (PEM 폐루프 식별용)
 
                 // 다른 축 u도 기록 (MISO N4SID용)
                 while (_sess.OtherU.Count < _otherAxes.Count)
@@ -1287,12 +1284,8 @@ namespace PIDAutoTuner
         /// - PID가 안정적으로 잘 작동하면 u/y가 거의 일정 → 플랜트 정보 없음
         /// - 외부에서 SP를 흔들어야 PID가 반응하고, 그 반응에서 플랜트 특성이 드러남
         /// </summary>
-        /// <summary>현재 틱의 가진 신호값 (PEM 폐루프 식별용 외생 입력 r). 비활성/조건 미충족 시 0.</summary>
-        private double _lastExciteValue = 0.0;
-
         private void ApplyExcitation(float dt)
         {
-            _lastExciteValue = 0.0;
             if (!_s.ExciteEnabled) return;        // 가진 꺼져있으면 무시
             if (_s.ExciteWave == WaveType.Off) return;
             if (!_hasBaseSetPointAdjust) return;   // 원래 SP를 백업 못 했으면 무시
@@ -1367,7 +1360,6 @@ namespace PIDAutoTuner
                     }
             }
 
-            _lastExciteValue = x;
             try
             {
                 this._focus.SetPointAdjust.Us = _baseSetPointAdjust + (float)x;
@@ -2045,6 +2037,21 @@ namespace PIDAutoTuner
             int N = Math.Min(u.Length, y.Length);
             if (N < 200) throw new Exception("Too few samples for PEM (need >= 200)");
 
+            // ── 0. 입력 sanity check ──
+            // NaN/Inf, 가진 전무(u std ≈ 0), 응답 전무(y std ≈ 0) 차단 → silent 실패 방지
+            double sumU = 0, sumU2 = 0, sumY = 0, sumY2 = 0;
+            for (int i = 0; i < N; i++)
+            {
+                if (double.IsNaN(u[i]) || double.IsInfinity(u[i])) throw new Exception("u has NaN/Inf");
+                if (double.IsNaN(y[i]) || double.IsInfinity(y[i])) throw new Exception("y has NaN/Inf");
+                sumU += u[i]; sumU2 += u[i] * u[i];
+                sumY += y[i]; sumY2 += y[i] * y[i];
+            }
+            double stdU = Math.Sqrt(Math.Max(0, sumU2 / N - (sumU / N) * (sumU / N)));
+            double stdY = Math.Sqrt(Math.Max(0, sumY2 / N - (sumY / N) * (sumY / N)));
+            if (stdU < 1e-5) throw new Exception($"Excitation too weak (std(u)={stdU:0.0e})");
+            if (stdY < 1e-5) throw new Exception($"Response too weak (std(y)={stdY:0.0e})");
+
             // ── 1. PBSID-opt 초기 식별 ──
             int pastP = Math.Min(30, N / 8);
             var initModel = PemIdentifier.IdentifyPbsid(u, y, pastP);
@@ -2151,59 +2158,75 @@ namespace PIDAutoTuner
             double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
             double[] hi = { Math.Log(1.0),   Math.Log(50.0), Math.Log(1.0)   };
 
-            var rng = new System.Random(42);
-            double[][] pos = new double[nParticles][];
-            double[][] vel = new double[nParticles][];
-            double[][] pBest = new double[nParticles][];
-            double[] pBestCost = new double[nParticles];
-            double[] gBest = new double[3];
-            double gBestCost = double.MaxValue;
+            // 멀티시드 앙상블: 3개 독립 PSO 실행 → 최저 cost 선택
+            // 단일 시드(42)는 재현성 좋지만 지역해에 갇힐 수 있음.
+            // 여러 시드로 초기 분포 다양화 → 전역해 도달 확률 ↑, variance 추정 가능.
+            int[] seeds = { 42, 17, 83 };
+            double[] globalBest = new double[3];
+            double globalBestCost = double.MaxValue;
 
-            for (int p = 0; p < nParticles; p++)
+            foreach (int seed in seeds)
             {
-                pos[p] = new double[3]; vel[p] = new double[3]; pBest[p] = new double[3];
-                for (int d = 0; d < 3; d++)
-                {
-                    pos[p][d] = lo[d] + rng.NextDouble() * (hi[d] - lo[d]);
-                    vel[p][d] = (rng.NextDouble() - 0.5) * (hi[d] - lo[d]) * 0.1;
-                    pBest[p][d] = pos[p][d];
-                }
-                double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
-                pBestCost[p] = cost;
-                if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
-            }
+                var rng = new System.Random(seed);
+                double[][] pos = new double[nParticles][];
+                double[][] vel = new double[nParticles][];
+                double[][] pBest = new double[nParticles][];
+                double[] pBestCost = new double[nParticles];
+                double[] gBest = new double[3];
+                double gBestCost = double.MaxValue;
 
-            for (int it = 0; it < maxIter; it++)
-            {
                 for (int p = 0; p < nParticles; p++)
                 {
+                    pos[p] = new double[3]; vel[p] = new double[3]; pBest[p] = new double[3];
                     for (int d = 0; d < 3; d++)
                     {
-                        double r1 = rng.NextDouble();
-                        double r2 = rng.NextDouble();
-                        vel[p][d] = w_pso * vel[p][d]
-                                  + c1 * r1 * (pBest[p][d] - pos[p][d])
-                                  + c2 * r2 * (gBest[d] - pos[p][d]);
-                        pos[p][d] += vel[p][d];
-                        if (pos[p][d] < lo[d]) { pos[p][d] = lo[d]; vel[p][d] = 0; }
-                        if (pos[p][d] > hi[d]) { pos[p][d] = hi[d]; vel[p][d] = 0; }
+                        pos[p][d] = lo[d] + rng.NextDouble() * (hi[d] - lo[d]);
+                        vel[p][d] = (rng.NextDouble() - 0.5) * (hi[d] - lo[d]) * 0.1;
+                        pBest[p][d] = pos[p][d];
                     }
                     double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
-                    if (cost < pBestCost[p])
+                    pBestCost[p] = cost;
+                    if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
+                }
+
+                for (int it = 0; it < maxIter; it++)
+                {
+                    for (int p = 0; p < nParticles; p++)
                     {
-                        pBestCost[p] = cost;
-                        Array.Copy(pos[p], pBest[p], 3);
-                        if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
+                        for (int d = 0; d < 3; d++)
+                        {
+                            double r1 = rng.NextDouble();
+                            double r2 = rng.NextDouble();
+                            vel[p][d] = w_pso * vel[p][d]
+                                      + c1 * r1 * (pBest[p][d] - pos[p][d])
+                                      + c2 * r2 * (gBest[d] - pos[p][d]);
+                            pos[p][d] += vel[p][d];
+                            if (pos[p][d] < lo[d]) { pos[p][d] = lo[d]; vel[p][d] = 0; }
+                            if (pos[p][d] > hi[d]) { pos[p][d] = hi[d]; vel[p][d] = 0; }
+                        }
+                        double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
+                        if (cost < pBestCost[p])
+                        {
+                            pBestCost[p] = cost;
+                            Array.Copy(pos[p], pBest[p], 3);
+                            if (cost < gBestCost) { gBestCost = cost; Array.Copy(pos[p], gBest, 3); }
+                        }
                     }
+                }
+
+                if (gBestCost < globalBestCost)
+                {
+                    globalBestCost = gBestCost;
+                    Array.Copy(gBest, globalBest, 3);
                 }
             }
 
-            double bestKp = Math.Max(0.001, Math.Min(1.0,   Math.Exp(gBest[0])));
-            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBest[1])));
-            double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBest[2])));
+            double bestKp = Math.Max(0.001, Math.Min(1.0,   Math.Exp(globalBest[0])));
+            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(globalBest[1])));
+            double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(globalBest[2])));
 
             string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
-            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} cost={gBestCost:0.000}";
+            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} cost={globalBestCost:0.000}";
 
             return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info };
         }

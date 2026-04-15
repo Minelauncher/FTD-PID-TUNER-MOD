@@ -1189,10 +1189,11 @@ namespace PIDAutoTuner
             }
 
             _s.SettlingTimeTs = (float)bestTs;
-            VrftResult r = bestResult;
+            VrftResult vrft = bestResult;
 
-            // 모델 식별도 병행 계산 — VRFT의 Ti가 신뢰 불가일 때 대체
-            string modelMsg = "";
+            // N4SID 모델 식별 (주력) — 성공하면 전체 PID 사용, 실패하면 VRFT fallback
+            double finalKp, finalTi, finalTd;
+            string method;
             try
             {
                 // 다른 축 u 데이터 준비 (최장 블록과 동일 구간)
@@ -1204,26 +1205,29 @@ namespace PIDAutoTuner
                         _sess.OtherU[ai].CopyTo(blkStart, otherU[ai], 0, blkLen);
                 }
                 ModelPidResult mr = ComputeModelPid(u, y, dt, otherU);
-                modelMsg = $" | Model: {mr.ModelInfo} Kp={mr.Kp:0.000} Ti={mr.Ti:0.0} Td={mr.Td:0.00}";
 
-                // VRFT Ti가 fallback(IMC 규칙)을 탄 경우, 모델 식별의 Ti를 우선 사용
-                if (r.Ti <= 0.1 || r.Ti >= 100.0)
-                {
-                    r.Ti = mr.Ti;
-                }
+                finalKp = mr.Kp;
+                finalTi = mr.Ti;
+                finalTd = mr.Td;
+                method = mr.ModelInfo;
             }
-            catch { /* 모델 식별 실패해도 VRFT 결과는 유지 */ }
+            catch
+            {
+                // N4SID 실패 → VRFT fallback
+                finalKp = vrft.Kp;
+                finalTi = vrft.Ti;
+                finalTd = vrft.Td;
+                method = $"VRFT (N4SID failed) Ts={bestTs:0.00}";
+            }
 
             _sess.HasResult = true;
-            _sess.Kp = r.Kp;
-            _sess.Ti = r.Ti;
-            _sess.Td = r.Td;
-            _sess.FitRmse = r.Rmse;
+            _sess.Kp = finalKp;
+            _sess.Ti = finalTi;
+            _sess.Td = finalTd;
+            _sess.FitRmse = vrft.Rmse;
 
             _autoState = AutoTuneState.Done;
-            _sess.LastMessage = string.IsNullOrEmpty(r.Warning)
-                ? $"Done | Ts={bestTs:0.00} u=[{uMin:0.000},{uMax:0.000}] y=[{yMin:0.0},{yMax:0.0}]{modelMsg}"
-                : $"Done (warning: {r.Warning}){modelMsg}";
+            _sess.LastMessage = $"Done | {method} → Kp={finalKp:0.000} Ti={finalTi:0.1} Td={finalTd:0.00}";
         }
 
         private void CaptureSetPointAdjustBase()

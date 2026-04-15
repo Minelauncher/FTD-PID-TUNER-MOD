@@ -728,19 +728,38 @@ namespace PIDAutoTuner
                 M.m<VariableControllerMaster>(_ =>
                 {
                     string rec;
-                    if (_sess.Recording)
+                    if (_pidExciteCollector != null && _autoState == AutoTuneState.Recording)
+                        rec = "PID+excite / PID+가진";
+                    else if (_autoState == AutoTuneState.Computing)
+                        rec = "Computing / 계산 중";
+                    else if (_sess.Recording)
                         rec = "Recording / 녹화중";
                     else if (_autoState == AutoTuneState.OpenLoop)
                         rec = "Step ID / 스텝 식별 중";
+                    else if (_autoState == AutoTuneState.Done)
+                        rec = "Done / 완료";
+                    else if (_autoState == AutoTuneState.Failed)
+                        rec = "Failed / 실패";
                     else
                         rec = "Idle / 대기";
                     double dt = Time.fixedDeltaTime;
-                    int lastBlkStart = _sess.BlockStarts.Count > 0
-                        ? _sess.BlockStarts[_sess.BlockStarts.Count - 1] : 0;
-                    int currentBlk = _sess.U.Count - lastBlkStart;
+
+                    // 진행 카운트: 활성 컬렉터 → _sess 순서로 확인
+                    int progressCount = 0;
+                    if (_pidExciteCollector != null)
+                        progressCount = _pidExciteCollector.U.Count;
+                    else if (_openLoopCollector != null)
+                        progressCount = _openLoopCollector.U.Count;
+                    else
+                    {
+                        int lastBlkStart = _sess.BlockStarts.Count > 0
+                            ? _sess.BlockStarts[_sess.BlockStarts.Count - 1] : 0;
+                        progressCount = _sess.U.Count - lastBlkStart;
+                    }
+
                     return
                         $"Status: {rec}\n" +
-                        $"Current block: {currentBlk} / {_s.MinSamples}  (blocks: {_sess.BlockStarts.Count})\n" +
+                        $"Samples: {progressCount} / {_s.MinSamples}  (blocks: {_sess.BlockStarts.Count})\n" +
                         $"Saturated: {_sess.SaturatedCount}  |  Rejected: {_sess.RejectedCount}\n" +
                         $"FixedDeltaTime: {dt:0.000}s\n" +
                         $"Msg: {_sess.LastMessage}";
@@ -899,9 +918,9 @@ namespace PIDAutoTuner
 
                     string result =
                         $"── Single PID ──\n" +
-                        $"Kp = {_sess.Kp:0.000}\n" +
-                        $"Ti = {_sess.Ti:0.0} s\n" +
-                        $"Td = {_sess.Td:0.0} s\n" +
+                        $"Kp = {_sess.Kp:0.0000}\n" +
+                        $"Ti = {_sess.Ti:0.00} s\n" +
+                        $"Td = {_sess.Td:0.0000} s\n" +
                         $"Fit (RMSE) = {_sess.FitRmse:0.0000}";
 
                     // ── PI(외부) × PD(내부) 분해 ──

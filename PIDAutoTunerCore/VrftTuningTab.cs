@@ -257,6 +257,8 @@ namespace PIDAutoTuner
             public double AdaptiveCurrentAmp;    // 현재 실제 적용 진폭
             public double AdaptiveYSum;          // y 합 (평균 계산용)
             public double AdaptiveYSqSum;        // y² 합 (분산 계산용)
+            public double AdaptiveUSum;          // u 합 (제어 활동도 측정)
+            public double AdaptiveUSqSum;        // u² 합
             public int AdaptiveCount;            // 누적 횟수
             public int AdaptiveCheckInterval = 60; // 몇 샘플마다 체크 (약 1~1.5초)
             public int AdaptiveBoostCount;       // 진폭 증가 횟수
@@ -294,6 +296,8 @@ namespace PIDAutoTuner
                 AdaptiveCurrentAmp = 0;
                 AdaptiveYSum = 0;
                 AdaptiveYSqSum = 0;
+                AdaptiveUSum = 0;
+                AdaptiveUSqSum = 0;
                 AdaptiveCount = 0;
                 AdaptiveBoostCount = 0;
                 LastU = 0;
@@ -576,26 +580,35 @@ namespace PIDAutoTuner
                 double y = c.LastProcessVariable;
                 _sess.LastU = u;
 
-                // ── 적응형 진폭: y의 변동(stddev)이 가진 대비 너무 작으면 진폭 증가 ──
-                // 연속 포화 중의 y는 비선형 → stddev가 크게 나와서 적응형을 속일 수 있으므로 제외
+                // ── 적응형 진폭: 정보량 부족 시 진폭 증가 ──
+                // 정보량 판단: y 변동 (yStd/amp) AND u 제어 활동 (uStd) 둘 다 고려.
+                //   기존 yStd/amp 만 보면 강한 PID / 고주파 컷오프 상황에서 u가 활발해도 boost 됨
+                //   → 불필요한 포화 유발. u 가 이미 움직이면 N4SID/PEM 식별에 정보 충분.
                 if (_s.AdaptiveAmp && _s.ExciteEnabled && _autoState == AutoTuneState.Recording
                     && _sess.ConsecutiveSaturated < _sess.ConsecutiveSatThreshold)
                 {
                     _sess.AdaptiveYSum += y;
                     _sess.AdaptiveYSqSum += y * y;
+                    _sess.AdaptiveUSum += u;
+                    _sess.AdaptiveUSqSum += u * u;
                     _sess.AdaptiveCount++;
 
                     if (_sess.AdaptiveCount >= _sess.AdaptiveCheckInterval)
                     {
-                        double mean = _sess.AdaptiveYSum / _sess.AdaptiveCount;
-                        double variance = (_sess.AdaptiveYSqSum / _sess.AdaptiveCount) - mean * mean;
-                        double yStd = variance > 0 ? Math.Sqrt(variance) : 0;
+                        double yMean = _sess.AdaptiveYSum / _sess.AdaptiveCount;
+                        double yVar = (_sess.AdaptiveYSqSum / _sess.AdaptiveCount) - yMean * yMean;
+                        double yStd = yVar > 0 ? Math.Sqrt(yVar) : 0;
+                        double uMean = _sess.AdaptiveUSum / _sess.AdaptiveCount;
+                        double uVar = (_sess.AdaptiveUSqSum / _sess.AdaptiveCount) - uMean * uMean;
+                        double uStd = uVar > 0 ? Math.Sqrt(uVar) : 0;
                         double amp = Math.Max(0.01, _sess.AdaptiveCurrentAmp);
 
-                        // y의 변동이 가진 진폭의 목표 비율보다 작으면 → PID가 너무 잘 눌렀다
-                        double ratio = yStd / amp;
+                        double yRatio = yStd / amp;          // 폐루프 민감도 근사
+                        const double U_INFO_THRESHOLD = 0.1; // u 변동이 이 이상이면 정보 충분
+                        bool yLow = yRatio < _s.AdaptiveSnrTarget;
+                        bool uLow = uStd < U_INFO_THRESHOLD;
 
-                        if (ratio < _s.AdaptiveSnrTarget && amp < _s.AdaptiveAmpMax)
+                        if (yLow && uLow && amp < _s.AdaptiveAmpMax)
                         {
                             double newAmp = Math.Min(amp * 2.0, _s.AdaptiveAmpMax);
                             _sess.AdaptiveCurrentAmp = newAmp;
@@ -609,11 +622,17 @@ namespace PIDAutoTuner
                                 _sess.BlockStartT = _sess.T; // chirp를 새 블록에서 처음부터 다시
                             }
 
-                            _sess.LastMessage = $"Adaptive: amp {amp:0.00}→{newAmp:0.00} / 적응: 진폭 {amp:0.00}→{newAmp:0.00} (yStd/amp={ratio:0.000} < {_s.AdaptiveSnrTarget:0.000})";
+                            _sess.LastMessage = $"Adaptive: amp {amp:0.00}→{newAmp:0.00} / 적응: 진폭 {amp:0.00}→{newAmp:0.00} (yStd/amp={yRatio:0.00}, uStd={uStd:0.00} 둘 다 낮음)";
+                        }
+                        else if (yLow && !uLow)
+                        {
+                            _sess.LastMessage = $"Info OK (u active, uStd={uStd:0.00}) / 정보 충분: u 활발 (yStd/amp={yRatio:0.00})";
                         }
 
                         _sess.AdaptiveYSum = 0;
                         _sess.AdaptiveYSqSum = 0;
+                        _sess.AdaptiveUSum = 0;
+                        _sess.AdaptiveUSqSum = 0;
                         _sess.AdaptiveCount = 0;
                     }
                 }

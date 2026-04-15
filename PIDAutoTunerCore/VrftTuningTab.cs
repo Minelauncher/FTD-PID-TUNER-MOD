@@ -1777,11 +1777,20 @@ namespace PIDAutoTuner
             var svd = YfPerp.Svd();
             var sigma = svd.S;
 
+            // Gavish-Donoho 최적 하드 임계값: τ* = (4/√3) × σ_median
+            // 노이즈가 있는 행렬에서 최적 복원 오차를 최소화하는 절단점 (이론적 유도)
             int maxOrder = Math.Min(4, sigma.Count);
+            double[] sigArr = new double[sigma.Count];
+            for (int i = 0; i < sigma.Count; i++)
+                sigArr[i] = sigma[i];
+            Array.Sort(sigArr);
+            double sigMedian = sigArr[sigArr.Length / 2];
+            double gdThreshold = (4.0 / Math.Sqrt(3.0)) * sigMedian; // ≈ 2.858 × median
+
             int order = 1;
             for (int i = 1; i < maxOrder; i++)
             {
-                if (sigma[i] < sigma[0] * 0.01) break;
+                if (sigma[i] < gdThreshold) break;
                 order = i + 1;
             }
 

@@ -1993,12 +1993,18 @@ namespace PIDAutoTuner
             for (int i = 0; i < hLen; i++)
                 dcGain += Hf[i].Real * dt; // 스텝 응답 = 임펄스 응답의 누적합
 
-            double kp, ti, td;
-            string modelInfo;
+            // ── 플랜트 임펄스 응답 h[k] 추출 (시뮬레이션용) ──
+            // Hf의 실수부가 이미 임펄스 응답. 유효 길이로 자름.
+            double[] hImpulse = new double[hLen];
+            for (int i = 0; i < hLen; i++)
+                hImpulse[i] = Hf[i].Real;
 
-            if (isIntegrator || Math.Abs(dcGain) > 100)
+            // ── 모델 특성에서 IMC 초기값 계산 (탐색 시작점) ──
+            double tauP_est;
+            double kvOrK_sign;
+            bool useIpdt = isIntegrator || Math.Abs(dcGain) > 100;
+            if (useIpdt)
             {
-                // IPDT: 속도 게인
                 double hSteady = 0;
                 int steadyStart = hLen * 3 / 4;
                 for (int i = steadyStart; i < hLen; i++)
@@ -2006,33 +2012,135 @@ namespace PIDAutoTuner
                 hSteady /= Math.Max(1, hLen - steadyStart);
                 double Kv = hSteady / dt;
                 if (Math.Abs(Kv) < 1e-6) Kv = 1.0;
-
-                double lambda = Math.Max(2.0 * tauDelay, 0.2);
-                kp = 1.0 / (Math.Abs(Kv) * (2.0 * tauDelay + lambda));
-                ti = 2.0 * (2.0 * tauDelay + lambda);
-                td = tauDelay;
-
-                modelInfo = $"N4SID-IPDT n={order} m={m} Kv={Kv:0.000} τ={tauDelay:0.00}";
+                kvOrK_sign = Math.Sign(Kv);
+                tauP_est = Math.Max(dt, dominantTau);
             }
             else
             {
-                double K = dcGain;
-                double tauP = Math.Max(dt, dominantTau);
-
-                double lambda = Math.Max(tauDelay, 0.1);
-                kp = tauP / (Math.Abs(K) * (tauDelay + lambda));
-                ti = tauP;
-                td = tauDelay / 2.0;
-
-                modelInfo = $"N4SID-FOPDT n={order} m={m} K={K:0.000} τp={tauP:0.00} τ={tauDelay:0.00}";
+                kvOrK_sign = Math.Sign(dcGain);
+                if (kvOrK_sign == 0) kvOrK_sign = 1;
+                tauP_est = Math.Max(dt, dominantTau);
             }
 
-            kp = Math.Abs(kp);
-            kp = Math.Max(0.001, Math.Min(1.0, kp));
-            ti = Math.Max(0.1, Math.Min(250.0, ti));
-            td = Math.Max(0.0, Math.Min(10.0, td));
+            // ── PID 시뮬레이션 + 탐색 ──
+            // 목표: 식별된 플랜트 모델 위에서 M(s)의 스텝 응답을 가장 잘 추종하는 PID
+            // 탐색 공간 (log 스케일):
+            //   Kp ∈ [0.001, 1.0]     (10점)
+            //   Ti ∈ [0.1, 50.0]      (8점)
+            //   Td ∈ [0.001, 1.0]     (8점)
+            // 총 640회 시뮬레이션, 각 시뮬 400스텝 ≈ 수백 ms
 
-            return new ModelPidResult { Kp = kp, Ti = ti, Td = td, ModelInfo = modelInfo };
+            int simLen = 400; // 8초 @ dt=0.02
+            double targetTs = Math.Max(0.5, 2.0 * tauP_est); // 원하는 정착시간
+            double tauM = 0.2 * targetTs;
+
+            // 목표 응답 (M의 스텝 응답): 2차 모델
+            double[] yTarget = new double[simLen];
+            for (int k = 0; k < simLen; k++)
+            {
+                double t = k * dt;
+                // M(s) = 1/(1+τM·s)^2 의 스텝 응답: 1 - (1 + t/τM) * e^(-t/τM)
+                double tm = t / tauM;
+                yTarget[k] = 1.0 - (1.0 + tm) * Math.Exp(-tm);
+            }
+
+            double bestCost = double.MaxValue;
+            double bestKp = 0.05, bestTi = 1.0, bestTd = 0.0;
+
+            int nKp = 10, nTi = 8, nTd = 8;
+            double[] logKp = new double[nKp];
+            double[] logTi = new double[nTi];
+            double[] logTd = new double[nTd];
+            for (int i = 0; i < nKp; i++)
+                logKp[i] = 0.001 * Math.Pow(1000.0, (double)i / (nKp - 1)); // 0.001 ~ 1.0
+            for (int i = 0; i < nTi; i++)
+                logTi[i] = 0.1 * Math.Pow(500.0, (double)i / (nTi - 1));    // 0.1 ~ 50
+            for (int i = 0; i < nTd; i++)
+                logTd[i] = 0.001 * Math.Pow(1000.0, (double)i / (nTd - 1)); // 0.001 ~ 1.0
+
+            // 플랜트 시뮬레이션 함수 (합성곱): y(k) = Σ h[j] * u(k-j)
+            // PID 루프: e=r-y, u = Kp*(e + ∫e/Ti + Td*de/dt)
+            for (int iKp = 0; iKp < nKp; iKp++)
+            {
+                double tryKp = logKp[iKp];
+                for (int iTi = 0; iTi < nTi; iTi++)
+                {
+                    double tryTi = logTi[iTi];
+                    for (int iTd = 0; iTd < nTd; iTd++)
+                    {
+                        double tryTd = logTd[iTd];
+
+                        // 시뮬레이션
+                        double[] ySim = new double[simLen];
+                        double[] uSim = new double[simLen];
+                        double integ = 0;
+                        double prevE = 0;
+                        bool diverged = false;
+
+                        for (int k = 0; k < simLen; k++)
+                        {
+                            double r = 1.0; // 스텝 입력
+                            double y_k = 0;
+                            // 합성곱: y(k) = Σ h[jj] * u(k-1-jj) (인과적)
+                            for (int jj = 0; jj < hLen && jj < k; jj++)
+                                y_k += hImpulse[jj] * uSim[k - 1 - jj];
+                            // K의 부호를 고려 (역방향 플랜트면 u 부호 반전)
+                            // 여기서는 kvOrK_sign이 양수가 되도록 정규화된 모델로 가정
+                            ySim[k] = y_k * kvOrK_sign;
+
+                            double e = r - ySim[k];
+                            integ += e * dt;
+                            double deriv = (k > 0) ? (e - prevE) / dt : 0;
+                            prevE = e;
+
+                            double u_k = tryKp * (e + integ / tryTi + tryTd * deriv);
+                            // 포화
+                            if (u_k > 1.0) u_k = 1.0;
+                            else if (u_k < -1.0) u_k = -1.0;
+                            uSim[k] = u_k;
+
+                            if (double.IsNaN(ySim[k]) || double.IsInfinity(ySim[k]) || Math.Abs(ySim[k]) > 100)
+                            {
+                                diverged = true;
+                                break;
+                            }
+                        }
+
+                        if (diverged) continue;
+
+                        // 비용: ITAE (Integral of Time-weighted Absolute Error) + 오버슈트 패널티
+                        double cost = 0;
+                        double maxY = 0;
+                        for (int k = 0; k < simLen; k++)
+                        {
+                            double err = yTarget[k] - ySim[k];
+                            cost += k * dt * Math.Abs(err) * dt; // ITAE
+                            if (ySim[k] > maxY) maxY = ySim[k];
+                        }
+                        double overshoot = Math.Max(0, maxY - 1.0);
+                        cost += 10.0 * overshoot; // 오버슈트 패널티
+
+                        if (cost < bestCost)
+                        {
+                            bestCost = cost;
+                            bestKp = tryKp;
+                            bestTi = tryTi;
+                            bestTd = tryTd;
+                        }
+                    }
+                }
+            }
+
+            // 클램핑
+            bestKp = Math.Max(0.001, Math.Min(1.0, bestKp));
+            bestTi = Math.Max(0.1, Math.Min(250.0, bestTi));
+            bestTd = Math.Max(0.0, Math.Min(10.0, bestTd));
+
+            string modelInfoStr = useIpdt
+                ? $"N4SID-Search IPDT n={order} m={m} τp={tauP_est:0.00} τ={tauDelay:0.00} cost={bestCost:0.000}"
+                : $"N4SID-Search FOPDT n={order} m={m} τp={tauP_est:0.00} τ={tauDelay:0.00} cost={bestCost:0.000}";
+
+            return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = modelInfoStr };
         }
 
         // ============================================================

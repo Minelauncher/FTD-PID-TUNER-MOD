@@ -508,11 +508,13 @@ namespace PIDAutoTuner
                             _sess.Td = td;
                             _autoState = AutoTuneState.Done;
                             _sess.LastMessage = $"Step ID ({modelType}) τ={tauDelay:0.00} y0={y0:0.0} slope={slope:0.0} N={olN} → Kp={kp:0.000} Ti={ti:0.0} Td={td:0.00}";
+                            _openLoopCollector = null; // cleanup
                         }
                         catch (Exception e)
                         {
                             _autoState = AutoTuneState.Failed;
                             _sess.LastMessage = "Open-loop failed: " + e.Message;
+                            _openLoopCollector = null; // cleanup on failure too
                         }
                     }
                     else
@@ -573,6 +575,7 @@ namespace PIDAutoTuner
                             _sess.Y.Add(_pidExciteCollector.Y[i]);
                         }
 
+                        _pidExciteCollector = null; // cleanup: 재진입 방지, 메모리 해제
                         _sess.Recording = false;
                         _autoState = AutoTuneState.Computing;
                         _sess.LastMessage = $"Recording done ({colN} samples), analyzing... / 녹화 완료, 분석 중...";
@@ -1011,6 +1014,12 @@ namespace PIDAutoTuner
         {
             _sess.Recording = false;
             RestoreSetPointAdjustIfNeeded();
+
+            // DataCollector 및 컬렉터 정리 (안전)
+            try { if (this._focus != null) this._focus.DataCollector = null; } catch { }
+            _pidExciteCollector = null;
+            _openLoopCollector = null;
+
             if (_autoState == AutoTuneState.Recording)
                 _autoState = AutoTuneState.Idle;
             _sess.LastMessage = "Recording stopped / 녹화 중지";
@@ -1027,9 +1036,9 @@ namespace PIDAutoTuner
         /// </summary>
         private void AutoTuneNow()
         {
-            if (_autoState == AutoTuneState.Recording)
+            if (_autoState != AutoTuneState.Idle && _autoState != AutoTuneState.Done && _autoState != AutoTuneState.Failed)
             {
-                _sess.LastMessage = "Auto-tune already in progress / 자동 튜닝 이미 진행 중";
+                _sess.LastMessage = "Tuning already in progress / 튜닝 이미 진행 중";
                 return;
             }
 

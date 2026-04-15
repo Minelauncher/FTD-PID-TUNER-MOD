@@ -109,6 +109,7 @@
 
 using System;                          // 기본 타입 (Math, Array, Exception 등)
 using System.Collections.Generic;      // List<T>, Dictionary 등 컬렉션
+using System.Linq;                     // Enumerable (ERA에서 사용)
 using System.Numerics;                 // Complex (복소수) — FFT 계산에 필수
 using BrilliantSkies.Ai.Control.Pids;  // FTD PID 관련 (VariableControllerMaster, IVariableController 등)
 using BrilliantSkies.Ui.Consoles;      // FTD UI 시스템 (ConsoleWindow, SuperScreen 등)
@@ -1638,8 +1639,8 @@ namespace PIDAutoTuner
         }
 
         // ============================================================
-        // 주파수 응답 기반 모델 식별 + IMC-PID
-        // 폐루프 데이터에서 H(jω) = Y/U 추정 → FOPDT/IPDT 피팅 → PID 산출
+        // ERA (Eigensystem Realization Algorithm) 기반 서브스페이스 모델 식별
+        // 임펄스 응답 → Hankel 행렬 → SVD → 상태공간(A,B,C,D) → IMC-PID
         // ============================================================
 
         private struct ModelPidResult
@@ -1653,14 +1654,11 @@ namespace PIDAutoTuner
             int N = Math.Min(u.Length, y.Length);
             if (N < 64) throw new Exception("Too few samples");
 
-            // 디트렌드
+            // ── 1. 임펄스 응답 추정 (Wiener deconvolution) ──
             double[] ud = new double[N]; Array.Copy(u, ud, N); Detrend(ud);
             double[] yd = new double[N]; Array.Copy(y, yd, N); Detrend(yd);
 
-            // FFT
             int Nfft = NextPow2(2 * N);
-            double fs = 1.0 / dt;
-
             Complex[] Uf = new Complex[Nfft];
             Complex[] Yf = new Complex[Nfft];
             for (int i = 0; i < N; i++)
@@ -1671,7 +1669,6 @@ namespace PIDAutoTuner
             Fourier.Forward(Uf, FourierOptions.Matlab);
             Fourier.Forward(Yf, FourierOptions.Matlab);
 
-            // H(jω) = Y/U (Wiener 정규화)
             double maxUmag2 = 0;
             for (int k = 0; k < Nfft; k++)
             {
@@ -1680,147 +1677,155 @@ namespace PIDAutoTuner
             }
             double reg = maxUmag2 * 1e-4;
 
-            // 저주파~중주파 빈에서 크기와 위상 수집 (DC 제외, ~fs/4까지)
-            int maxBin = Math.Max(4, Nfft / 4);
-            List<double> freqs = new List<double>();
-            List<double> mags = new List<double>();
-            List<double> phases = new List<double>();
-            List<double> weights = new List<double>();
-
-            double prevPhase = 0;
-            double cumUnwrap = 0;
-
-            for (int k = 1; k <= maxBin; k++)
+            Complex[] Hf = new Complex[Nfft];
+            for (int k = 0; k < Nfft; k++)
             {
                 double m2 = Uf[k].Real * Uf[k].Real + Uf[k].Imaginary * Uf[k].Imaginary;
-                double w = m2 / (m2 + reg); // SNR 가중치
-                if (w < 0.1) continue; // SNR 너무 낮은 빈 스킵
+                Hf[k] = (Complex.Conjugate(Uf[k]) * Yf[k]) / (m2 + reg);
+            }
+            Fourier.Inverse(Hf, FourierOptions.Matlab);
 
-                Complex H = (Complex.Conjugate(Uf[k]) * Yf[k]) / (m2 + reg);
-                double f = (double)k * fs / Nfft;
-                double omega = 2.0 * Math.PI * f;
-                double mag = H.Magnitude;
-                double rawPhase = Math.Atan2(H.Imaginary, H.Real);
+            // Markov 파라미터 h[k] = 임펄스 응답
+            int L = Math.Min(N / 4, 100); // Hankel 행렬 블록 크기
+            double[] h = new double[2 * L];
+            for (int i = 0; i < 2 * L; i++)
+                h[i] = Hf[i].Real;
 
-                // 위상 언래핑
-                if (freqs.Count > 0)
+            // ── 2. Hankel 행렬 구성 ──
+            // H0[i,j] = h[i+j+1], H1[i,j] = h[i+j+2]
+            var H0 = MB.Dense(L, L);
+            var H1 = MB.Dense(L, L);
+            for (int i = 0; i < L; i++)
+            {
+                for (int j = 0; j < L; j++)
                 {
-                    double diff = rawPhase - prevPhase;
-                    if (diff > Math.PI) cumUnwrap -= 2.0 * Math.PI;
-                    else if (diff < -Math.PI) cumUnwrap += 2.0 * Math.PI;
+                    int idx0 = i + j + 1;
+                    int idx1 = i + j + 2;
+                    H0[i, j] = (idx0 < 2 * L) ? h[idx0] : 0;
+                    H1[i, j] = (idx1 < 2 * L) ? h[idx1] : 0;
                 }
-                prevPhase = rawPhase;
-                double phase = rawPhase + cumUnwrap;
-
-                freqs.Add(omega);
-                mags.Add(mag);
-                phases.Add(phase);
-                weights.Add(w);
             }
 
-            if (freqs.Count < 4) throw new Exception("Insufficient frequency data");
+            // ── 3. SVD → 시스템 차수 결정 ──
+            var svd = H0.Svd();
+            var sigma = svd.S;
 
-            // ── 적분기 판별 ──
-            // 적분기: |H| ∝ 1/ω → log|H| vs logω 기울기 ≈ -1
-            // FOPDT: log|H| ≈ flat at low freq
-            double sumLF = 0, sumLM = 0, sumLFLM = 0, sumLFLF = 0, nLow = 0;
-            int lowBins = Math.Min(freqs.Count / 3, 10);
-            for (int i = 0; i < lowBins; i++)
+            // 차수: 특이값 급감 지점 (최대 4차)
+            int maxOrder = Math.Min(4, sigma.Count);
+            int order = 1;
+            for (int i = 1; i < maxOrder; i++)
             {
-                double lf = Math.Log(freqs[i]);
-                double lm = Math.Log(Math.Max(1e-12, mags[i]));
-                sumLF += lf;
-                sumLM += lm;
-                sumLFLM += lf * lm;
-                sumLFLF += lf * lf;
-                nLow++;
+                if (sigma[i] < sigma[0] * 0.01) break; // 1%보다 작으면 절단
+                order = i + 1;
             }
-            double magSlope = (nLow > 1)
-                ? (sumLFLM - nLow * (sumLF / nLow) * (sumLM / nLow)) / Math.Max(1e-12, sumLFLF - nLow * (sumLF / nLow) * (sumLF / nLow))
-                : 0;
 
-            bool isIntegrator = magSlope < -0.5; // 기울기 ≈ -1이면 적분기
+            // ── 4. ERA: 상태공간 모델 추출 ──
+            // Γ = U_n * Σ_n^(1/2),  O = Σ_n^(1/2) * V_n^T
+            // A = Σ_n^(-1/2) * U_n^T * H1 * V_n * Σ_n^(-1/2)
+            // C = first row of Γ
+            // B = first column of O
 
-            // ── τ (순수 지연) 추정: 위상 기울기 ──
-            // 중주파 영역에서 위상의 선형 기울기 = -(τ + 플랜트 위상)
-            // 저주파에서 추정 (플랜트 위상 영향 최소)
-            double sumWF = 0, sumWW = 0;
-            int phaseStart = isIntegrator ? 0 : lowBins; // 적분기는 저주파부터
-            int phaseEnd = Math.Min(freqs.Count, lowBins * 2);
-            for (int i = phaseStart; i < phaseEnd; i++)
+            var Un = svd.U.SubMatrix(0, L, 0, order);
+            var Vn = svd.VT.SubMatrix(0, order, 0, L).Transpose();
+            var SigmaHalf = MB.DiagonalOfDiagonalArray(order, order,
+                Enumerable.Range(0, order).Select(i => Math.Sqrt(sigma[i])).ToArray());
+            var SigmaInvHalf = MB.DiagonalOfDiagonalArray(order, order,
+                Enumerable.Range(0, order).Select(i => 1.0 / Math.Sqrt(Math.Max(1e-12, sigma[i]))).ToArray());
+
+            var A = SigmaInvHalf * Un.Transpose() * H1 * Vn * SigmaInvHalf;
+            var Gamma = Un * SigmaHalf;
+            var Obs = SigmaHalf * Vn.Transpose();
+
+            // C = first row of Gamma, B = first column of Obs
+            double C_val = Gamma[0, 0]; // SISO: C는 스칼라 (1×n의 첫 행)
+            double[] C_vec = new double[order];
+            double[] B_vec = new double[order];
+            for (int i = 0; i < order; i++)
             {
-                double expectedPhase = isIntegrator ? (-Math.PI / 2.0) : 0;
-                double residual = phases[i] - expectedPhase;
-                sumWF += weights[i] * freqs[i] * residual;
-                sumWW += weights[i] * freqs[i] * freqs[i];
+                C_vec[i] = Gamma[0, i];
+                B_vec[i] = Obs[i, 0];
             }
-            double tauDelay = (sumWW > 1e-12) ? -sumWF / sumWW : 0;
-            tauDelay = Math.Max(0, Math.Min(tauDelay, 0.5));
+            double D_val = h[0]; // 직접 전달
+
+            // ── 5. 상태공간 모델에서 PID 파라미터 추출 ──
+            // 적분기 판별: A의 고유값 중 1에 가까운 것이 있으면 적분기
+            var eigenA = A.Evd();
+            bool isIntegrator = false;
+            double dominantPole = 0;
+            double dominantTau = dt;
+            for (int i = 0; i < order; i++)
+            {
+                double eigReal = eigenA.EigenValues[i].Real;
+                double eigMag = eigenA.EigenValues[i].Magnitude;
+                if (eigMag > 0.99) isIntegrator = true; // z-평면에서 |λ| ≈ 1 = 적분기
+                // 지배적 극점 (가장 느린 = |λ|가 가장 큰 안정 극점)
+                if (eigReal > dominantPole && eigReal < 1.0)
+                {
+                    dominantPole = eigReal;
+                    // z-평면 극점 → 연속시간 시정수: τ = -dt / ln(|λ|)
+                    dominantTau = -dt / Math.Log(Math.Max(1e-12, eigMag));
+                }
+            }
+
+            // DC 게인: G(1) = C*(I-A)^(-1)*B + D (z=1)
+            var I_A = MB.DenseIdentity(order) - A;
+            double dcGain = D_val;
+            try
+            {
+                var x_dc = I_A.Solve(VB.DenseOfArray(B_vec));
+                for (int i = 0; i < order; i++)
+                    dcGain += C_vec[i] * x_dc[i];
+            }
+            catch { /* I-A가 특이 = 적분기 → dcGain = ∞ */ isIntegrator = true; }
+
+            // 순수 지연: 임펄스 응답에서 첫 유의미한 반응까지
+            double tauDelay = 0;
+            double hMax = 0;
+            for (int i = 0; i < L; i++)
+                hMax = Math.Max(hMax, Math.Abs(h[i]));
+            for (int i = 0; i < L; i++)
+            {
+                if (Math.Abs(h[i]) > hMax * 0.05)
+                {
+                    tauDelay = Math.Max(0, (i - 1)) * dt;
+                    break;
+                }
+            }
+            tauDelay = Math.Min(tauDelay, 0.5);
 
             double kp, ti, td;
             string modelInfo;
 
-            if (isIntegrator)
+            if (isIntegrator || Math.Abs(dcGain) > 1000)
             {
-                // ── IPDT: H(jω) = Kv/(jω) · e^(-jωτ) ──
-                // |H| = Kv/ω → Kv = |H| * ω (저주파 평균)
-                double kvSum = 0;
-                double kvW = 0;
-                for (int i = 0; i < lowBins; i++)
-                {
-                    double kv = mags[i] * freqs[i];
-                    kvSum += weights[i] * kv;
-                    kvW += weights[i];
-                }
-                double Kv = (kvW > 0) ? kvSum / kvW : 1.0;
+                // IPDT: 속도 게인 = 임펄스 응답의 정상상태 값 / dt
+                double hSteady = 0;
+                int steadyStart = Math.Min(L - 1, L * 3 / 4);
+                for (int i = steadyStart; i < L; i++)
+                    hSteady += h[i];
+                hSteady /= Math.Max(1, L - steadyStart);
+                double Kv = hSteady / dt; // 적분기의 속도 게인
+                if (Math.Abs(Kv) < 1e-6) Kv = 1.0;
 
                 double lambda = Math.Max(2.0 * tauDelay, 0.2);
-                kp = 1.0 / (Kv * (2.0 * tauDelay + lambda));
+                kp = 1.0 / (Math.Abs(Kv) * (2.0 * tauDelay + lambda));
                 ti = 2.0 * (2.0 * tauDelay + lambda);
                 td = tauDelay;
 
-                modelInfo = $"IPDT Kv={Kv:0.000} τ={tauDelay:0.00}";
+                modelInfo = $"ERA-IPDT n={order} Kv={Kv:0.000} τ={tauDelay:0.00}";
             }
             else
             {
-                // ── FOPDT: H(jω) = K/(1+jωτp) · e^(-jωτ) ──
-                // K = |H(0)| ≈ 저주파 평균 크기
-                double kSum = 0, kW = 0;
-                for (int i = 0; i < lowBins; i++)
-                {
-                    kSum += weights[i] * mags[i];
-                    kW += weights[i];
-                }
-                double K = (kW > 0) ? kSum / kW : 1.0;
-
-                // τp: |H| = K/√(1+ω²τp²) → |H|² = K²/(1+ω²τp²)
-                // 선형화: 1/|H|² = 1/K² + (τp/K)² * ω²
-                // 기울기 = (τp/K)² → τp = K * √기울기
-                double sumW2 = 0, sumInvH2 = 0, sumW2InvH2 = 0, sumW2W2 = 0;
-                double nFit = 0;
-                for (int i = 0; i < freqs.Count && i < lowBins * 3; i++)
-                {
-                    if (mags[i] < 1e-12) continue;
-                    double w2 = freqs[i] * freqs[i];
-                    double invH2 = 1.0 / (mags[i] * mags[i]);
-                    sumW2 += w2;
-                    sumInvH2 += invH2;
-                    sumW2InvH2 += w2 * invH2;
-                    sumW2W2 += w2 * w2;
-                    nFit++;
-                }
-                double tpSlope = (nFit > 1)
-                    ? (sumW2InvH2 - nFit * (sumW2 / nFit) * (sumInvH2 / nFit)) / Math.Max(1e-12, sumW2W2 - nFit * (sumW2 / nFit) * (sumW2 / nFit))
-                    : 0;
-                double tauP = (tpSlope > 0) ? K * Math.Sqrt(tpSlope) : dt;
-                tauP = Math.Max(dt, tauP);
+                // FOPDT: DC게인과 지배적 시정수
+                double K = dcGain;
+                double tauP = Math.Max(dt, dominantTau);
 
                 double lambda = Math.Max(tauDelay, 0.1);
-                kp = tauP / (K * (tauDelay + lambda));
+                kp = tauP / (Math.Abs(K) * (tauDelay + lambda));
                 ti = tauP;
                 td = tauDelay / 2.0;
 
-                modelInfo = $"FOPDT K={K:0.000} τp={tauP:0.00} τ={tauDelay:0.00}";
+                modelInfo = $"ERA-FOPDT n={order} K={K:0.000} τp={tauP:0.00} τ={tauDelay:0.00}";
             }
 
             kp = Math.Abs(kp);

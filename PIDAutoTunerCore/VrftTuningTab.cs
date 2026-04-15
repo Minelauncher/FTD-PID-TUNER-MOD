@@ -2323,6 +2323,11 @@ namespace PIDAutoTuner
                 }
             }
 
+            // PSO 수렴 검사: 모든 particle 이 MaxValue 반환 → 식별된 모델이 시뮬에 부적합
+            // (주로 불안정한 A 또는 비현실적 DC/임펄스 → |y|>100 감지 → 모든 cost = MaxValue)
+            if (globalBestCost >= 1e100 || double.IsNaN(globalBestCost) || double.IsInfinity(globalBestCost))
+                throw new Exception("PEM PSO diverged (identified model unsuitable for sim)");
+
             double bestKp = Math.Max(0.001, Math.Min(1.0,   Math.Exp(globalBest[0])));
             double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(globalBest[1])));
             double bestTd = Math.Max(0.0,   Math.Min(10.0,  Math.Exp(globalBest[2])));
@@ -2331,7 +2336,7 @@ namespace PIDAutoTuner
             double identRatio = (stdY > 1e-10) ? (refined.InnovationRms / stdY) : double.NaN;
 
             string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
-            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} ident={identRatio:0.00} cost={globalBestCost:0.000}";
+            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} ident={identRatio:0.00} cost={globalBestCost:0.000e0}";
 
             return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info, IdentRatio = identRatio };
         }
@@ -2479,6 +2484,9 @@ namespace PIDAutoTuner
                     Array.Copy(gBest, gBestG, 3);
                 }
             }
+
+            if (gBestCostG >= 1e100 || double.IsNaN(gBestCostG) || double.IsInfinity(gBestCostG))
+                throw new Exception("BLA PSO diverged");
 
             double bestKp = Math.Max(0.001, Math.Min(1.0,   Math.Exp(gBestG[0])));
             double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBestG[1])));

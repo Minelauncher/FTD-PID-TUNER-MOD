@@ -112,6 +112,7 @@ using System.Collections.Generic;      // List<T>, Dictionary 등 컬렉션
 using System.Linq;                     // Enumerable (ERA에서 사용)
 using System.Numerics;                 // Complex (복소수) — FFT 계산에 필수
 using BrilliantSkies.Ai.Control.Pids;  // FTD PID 관련 (VariableControllerMaster, IVariableController 등)
+using BrilliantSkies.Core.Control.Tuning; // IAccelerationMeasurement
 using BrilliantSkies.Ui.Consoles;      // FTD UI 시스템 (ConsoleWindow, SuperScreen 등)
 using BrilliantSkies.Ui.Consoles.Getters;                          // M.m<T> — UI 값 갱신 래퍼
 using BrilliantSkies.Ui.Consoles.Interpretters.Subjective;         // SubjectiveDisplay 등
@@ -303,6 +304,7 @@ namespace PIDAutoTuner
         private readonly Session _sess = new Session();
         private AutoTuneState _autoState = AutoTuneState.Idle;
         private OpenLoopCollector _openLoopCollector = null;
+        private PidPlusExciteCollector _pidExciteCollector = null;
 
         // 다른 축 Controller (MISO N4SID용 커플링 분석)
         private readonly List<VariableControllerMaster> _otherAxes = new List<VariableControllerMaster>();
@@ -550,6 +552,38 @@ namespace PIDAutoTuner
 
                 double dt = Time.fixedDeltaTime;
                 if (dt <= 0) dt = 0.02;
+
+                // PidPlusExciteCollector 모드: collector가 데이터 자동 수집, 완료 체크만
+                if (_pidExciteCollector != null && _autoState == AutoTuneState.Recording)
+                {
+                    int colN = _pidExciteCollector.U.Count;
+                    if (colN >= _s.MinSamples || _pidExciteCollector.IsDone())
+                    {
+                        // 수집 완료 → DataCollector 해제 → AutoTuneCompute로 이동
+                        this._focus.DataCollector = null;
+
+                        // collector 데이터를 _sess에 복사 (AutoTuneCompute가 사용)
+                        _sess.U.Clear();
+                        _sess.Y.Clear();
+                        _sess.BlockStarts.Clear();
+                        _sess.BlockStarts.Add(0);
+                        for (int i = 0; i < colN; i++)
+                        {
+                            _sess.U.Add(_pidExciteCollector.U[i]);
+                            _sess.Y.Add(_pidExciteCollector.Y[i]);
+                        }
+
+                        _sess.Recording = false;
+                        _autoState = AutoTuneState.Computing;
+                        _sess.LastMessage = $"Recording done ({colN} samples), analyzing... / 녹화 완료, 분석 중...";
+                    }
+                    else
+                    {
+                        if (colN % 60 == 0)
+                            _sess.LastMessage = $"PID+excite: {colN}/{_s.MinSamples} samples";
+                    }
+                    return;
+                }
 
                 ApplyExcitation((float)dt);
 
@@ -1033,22 +1067,35 @@ namespace PIDAutoTuner
             }
             _sess.NaturalYStd = naturalStd;
 
-            // 시작 진폭: 자연 변동의 3배 이상, 최소 0.3
-            double startAmp = Math.Max(0.3, naturalStd * 3.0);
-            startAmp = Math.Min(startAmp, _s.AdaptiveAmpMax); // 최대 제한
+            // 시작 진폭: 자연 변동의 3배 이상, 최소 0.1 (u에 직접 더하므로 작게)
+            double startAmp = Math.Max(0.1, naturalStd * 0.05);
+            startAmp = Math.Min(startAmp, 0.3); // u 직접 가진은 0.3 상한
 
-            // 자극 자동 설정 (멀티사인: 넓은 대역, 포화에 강함)
-            _s.ExciteEnabled = true;
-            _s.ExciteWave = WaveType.MultiSine;
-            _s.ExciteAmp = (float)startAmp;
-            _s.ExciteFreqHz = 0.05f; // 최소 주파수
-            _s.ChirpEndHz = (float)Math.Min(fs / 4.0, 2.0); // 최대 주파수
-            _s.AdaptiveAmp = true;
+            // PID 복사본 생성 (원본 PID 상태를 건드리지 않기 위해)
+            var pidCopy = new PidStandardForm(
+                this._focus.Pid.kP.Us,
+                this._focus.Pid.kI.Us,
+                this._focus.Pid.kD.Us
+            );
 
-            _autoState = AutoTuneState.Recording;
-            StartRecording();
-            _sess.AdaptiveCurrentAmp = _s.ExciteAmp;
-            _sess.LastMessage = $"Recording (Kp={this._focus.Pid.kP.Us:0.000})... / 녹화 중 (Kp={this._focus.Pid.kP.Us:0.000})...";
+            // SP 공급자: AI가 주는 원래 SP를 그대로 추종
+            // (FTD 내부 PID와 동일하게 동작)
+            Func<float> getSp = () => this._focus.GetCurrentController().LastSetPoint;
+
+            // PID + 가진 collector
+            double duration = _s.MinSamples * dt;
+            _pidExciteCollector = new PidPlusExciteCollector(
+                pidCopy, getSp,
+                startAmp, duration,
+                0.05, Math.Min(fs / 4.0, 2.0), 12);
+
+            // DataCollector로 등록 → FTD가 이걸 호출, 원본 PID는 우회
+            this._focus.DataCollector = _pidExciteCollector;
+
+            _sess.Clear();
+            _autoState = AutoTuneState.Recording; // Recording 상태 유지 (계산은 AutoTuneCompute 사용)
+            _sess.Recording = true;
+            _sess.LastMessage = $"PID+excite started (amp={startAmp:0.000}) / PID+가진 시작";
         }
 
         /// <summary>

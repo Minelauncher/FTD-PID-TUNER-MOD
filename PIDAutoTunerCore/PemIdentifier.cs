@@ -73,11 +73,17 @@ namespace PIDAutoTuner
                 }
             }
 
-            // LS: θ = (Z Z^T)^-1 Z y
+            // LS with Tikhonov: θ = (Z Z^T + λ_t·I)^-1 Z y
+            // 폐루프에서 u, y 상관 → Z Z^T 가 병태일 수 있음.
+            // λ_t 를 trace(ZZ^T) 의 상대 크기로 스케일.
             Vector<double> theta;
             try
             {
                 var ZZT = Z * Z.Transpose();
+                double traceZZT = 0;
+                for (int i = 0; i < ZZT.RowCount; i++) traceZZT += ZZT[i, i];
+                double lambda_t = 1e-8 * traceZZT / ZZT.RowCount;
+                for (int i = 0; i < ZZT.RowCount; i++) ZZT[i, i] += lambda_t;
                 theta = ZZT.Solve(Z * Yvec);
             }
             catch { throw new Exception("VAR LS failed"); }
@@ -143,11 +149,19 @@ namespace PIDAutoTuner
             var C_mat = MB.Dense(1, order);
             for (int i = 0; i < order; i++) C_mat[0, i] = Gamma[0, i];
 
-            // A_K 추출: Γ_lower ≈ Γ_upper · A_K (shift trick)
+            // A_K 추출: Γ_lower ≈ Γ_upper · A_K (shift trick, Tikhonov 정규화)
             var Gu = Gamma.SubMatrix(0, hf - 1, 0, order);
             var Gl = Gamma.SubMatrix(1, hf - 1, 0, order);
             Matrix<double> AK;
-            try { AK = (Gu.Transpose() * Gu).Inverse() * Gu.Transpose() * Gl; }
+            try
+            {
+                var GuTGu = Gu.Transpose() * Gu;
+                double traceGG = 0;
+                for (int i = 0; i < order; i++) traceGG += GuTGu[i, i];
+                double lambda_s = 1e-8 * traceGG / order;
+                for (int i = 0; i < order; i++) GuTGu[i, i] += lambda_s;
+                AK = GuTGu.Solve(Gu.Transpose() * Gl);
+            }
             catch { throw new Exception("A_K shift LS failed"); }
 
             // [B_K | K] = Δ 첫 두 컬럼 (블록 1)
@@ -196,24 +210,33 @@ namespace PIDAutoTuner
             double prevCost = ComputeCostOnly(theta, n, ud, yd, N);
             double initCost = prevCost;
 
+            // LM λ 는 iter 간 지속. 성공 시 감소(GN 방향 신뢰도 ↑), 실패 시 증가(경사하강 ↑).
+            // 표준 Marquardt adaptation: 성공 /= νDown, 실패 *= νUp.
+            double lambda = 1e-3;
+            const double nuUp = 10.0;
+            const double nuDown = 10.0;
+            const double lambdaMin = 1e-10;
+            const double lambdaMax = 1e10;
+
             for (int iter = 0; iter < maxIter; iter++)
             {
-                // 잔차 e(θ) (N-vec)
                 var e0 = ComputeResiduals(theta, n, ud, yd, N);
                 double cost0 = SumSquares(e0) / N;
 
-                // FD Jacobian: J[k, i] = (e(θ+h·e_i)[k] - e(θ-h·e_i)[k]) / (2h)
-                double h = 1e-5 * (1.0 + Norm(theta));
+                // FD Jacobian: 파라미터별 상대 스케일 적용
+                //   h_i = 1e-5 · max(|θ_i|, 1e-3)
+                // vec(A) (~O(1)) 와 D (~O(0.01)) 의 스케일 차이 보정
                 var J = MB.Dense(N, nParams);
                 for (int i = 0; i < nParams; i++)
                 {
+                    double h_i = 1e-5 * Math.Max(Math.Abs(theta[i]), 1e-3);
                     double save = theta[i];
-                    theta[i] = save + h;
+                    theta[i] = save + h_i;
                     var eP = ComputeResiduals(theta, n, ud, yd, N);
-                    theta[i] = save - h;
+                    theta[i] = save - h_i;
                     var eM = ComputeResiduals(theta, n, ud, yd, N);
                     theta[i] = save;
-                    double inv2h = 0.5 / h;
+                    double inv2h = 0.5 / h_i;
                     for (int k = 0; k < N; k++) J[k, i] = (eP[k] - eM[k]) * inv2h;
                 }
 
@@ -221,7 +244,6 @@ namespace PIDAutoTuner
                 var JJ = J.Transpose() * J;
                 var Je = J.Transpose() * VB.DenseOfArray(e0);
 
-                double lambda = 1e-3 * Math.Max(1e-10, cost0);
                 double[] thetaNew = new double[nParams];
                 bool accepted = false;
                 double newCost = cost0;
@@ -233,11 +255,11 @@ namespace PIDAutoTuner
 
                     Vector<double> delta;
                     try { delta = JJlam.Solve(-Je); }
-                    catch { lambda *= 10.0; continue; }
+                    catch { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
 
                     for (int i = 0; i < nParams; i++) thetaNew[i] = theta[i] + delta[i];
 
-                    if (!IsStable(thetaNew, n)) { lambda *= 10.0; continue; }
+                    if (!IsStable(thetaNew, n)) { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
 
                     double costN = ComputeCostOnly(thetaNew, n, ud, yd, N);
                     if (costN < cost0 && !double.IsNaN(costN) && !double.IsInfinity(costN))
@@ -245,9 +267,11 @@ namespace PIDAutoTuner
                         Array.Copy(thetaNew, theta, nParams);
                         newCost = costN;
                         accepted = true;
+                        // 성공 → λ 감소 (다음 iter 에서 GN 방향 더 신뢰)
+                        lambda = Math.Max(lambda / nuDown, lambdaMin);
                         break;
                     }
-                    lambda *= 10.0;
+                    lambda = Math.Min(lambda * nuUp, lambdaMax);
                 }
                 if (!accepted) break;
 
@@ -382,11 +406,6 @@ namespace PIDAutoTuner
             double s = 0;
             for (int i = 0; i < x.Length; i++) s += x[i] * x[i];
             return s;
-        }
-
-        private static double Norm(double[] x)
-        {
-            return Math.Sqrt(SumSquares(x));
         }
 
         private static void Detrend(double[] x)

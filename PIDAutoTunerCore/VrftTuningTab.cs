@@ -1994,89 +1994,126 @@ namespace PIDAutoTuner
             double bestCost = double.MaxValue;
             double bestKp = 0.05, bestTi = 1.0, bestTd = 0.0;
 
-            int nKp = 10, nTi = 8, nTd = 8;
-            double[] logKp = new double[nKp];
-            double[] logTi = new double[nTi];
-            double[] logTd = new double[nTd];
-            for (int i = 0; i < nKp; i++)
-                logKp[i] = 0.001 * Math.Pow(1000.0, (double)i / (nKp - 1)); // 0.001 ~ 1.0
-            for (int i = 0; i < nTi; i++)
-                logTi[i] = 0.1 * Math.Pow(500.0, (double)i / (nTi - 1));    // 0.1 ~ 50
-            for (int i = 0; i < nTd; i++)
-                logTd[i] = 0.001 * Math.Pow(1000.0, (double)i / (nTd - 1)); // 0.001 ~ 1.0
-
-            // 플랜트 시뮬레이션 함수 (합성곱): y(k) = Σ h[j] * u(k-j)
-            // PID 루프: e=r-y, u = Kp*(e + ∫e/Ti + Td*de/dt)
-            for (int iKp = 0; iKp < nKp; iKp++)
+            // ── 비용 함수: 주어진 (Kp, Ti, Td)에 대한 시뮬레이션 + 비용 ──
+            Func<double, double, double, double> evaluate = (tryKp, tryTi, tryTd) =>
             {
-                double tryKp = logKp[iKp];
-                for (int iTi = 0; iTi < nTi; iTi++)
+                double[] ySim = new double[simLen];
+                double[] uSim = new double[simLen];
+                double integ = 0;
+                double prevE = 0;
+
+                for (int k = 0; k < simLen; k++)
                 {
-                    double tryTi = logTi[iTi];
-                    for (int iTd = 0; iTd < nTd; iTd++)
+                    double r = 1.0;
+                    double y_k = 0;
+                    for (int jj = 0; jj < hLen && jj < k; jj++)
+                        y_k += hImpulse[jj] * uSim[k - 1 - jj];
+                    ySim[k] = y_k * kvOrK_sign;
+
+                    double e = r - ySim[k];
+                    integ += e * dt;
+                    double deriv = (k > 0) ? (e - prevE) / dt : 0;
+                    prevE = e;
+
+                    double u_k = tryKp * (e + integ / tryTi + tryTd * deriv);
+                    if (u_k > 1.0) u_k = 1.0;
+                    else if (u_k < -1.0) u_k = -1.0;
+                    uSim[k] = u_k;
+
+                    if (double.IsNaN(ySim[k]) || double.IsInfinity(ySim[k]) || Math.Abs(ySim[k]) > 100)
+                        return double.MaxValue; // 발산
+                }
+
+                double cost = 0;
+                double maxY = 0;
+                for (int k = 0; k < simLen; k++)
+                {
+                    double err = yTarget[k] - ySim[k];
+                    cost += k * dt * Math.Abs(err) * dt; // ITAE
+                    if (ySim[k] > maxY) maxY = ySim[k];
+                }
+                cost += 10.0 * Math.Max(0, maxY - 1.0); // 오버슈트 패널티
+                return cost;
+            };
+
+            // ── PSO (Particle Swarm Optimization) ──
+            // 로그 공간에서 탐색: x = [log(Kp), log(Ti), log(Td)]
+            // Kp: log(0.001)~log(1)  → [-6.9, 0]
+            // Ti: log(0.1)~log(50)   → [-2.3, 3.9]
+            // Td: log(0.001)~log(1)  → [-6.9, 0]
+            const int nParticles = 20;
+            const int maxIter = 30;
+            const double w = 0.7;   // 관성
+            const double c1 = 1.5;  // 인지 (개인 최적)
+            const double c2 = 1.5;  // 사회 (전체 최적)
+
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
+            double[] hi = { Math.Log(1.0),   Math.Log(50.0), Math.Log(1.0)   };
+
+            var rng = new System.Random(42); // 결정론적 (재현성)
+            double[][] pos = new double[nParticles][];
+            double[][] vel = new double[nParticles][];
+            double[][] pBest = new double[nParticles][];
+            double[] pBestCost = new double[nParticles];
+            double[] gBest = new double[3];
+            double gBestCost = double.MaxValue;
+
+            // 초기화
+            for (int p = 0; p < nParticles; p++)
+            {
+                pos[p] = new double[3];
+                vel[p] = new double[3];
+                pBest[p] = new double[3];
+                for (int d = 0; d < 3; d++)
+                {
+                    pos[p][d] = lo[d] + rng.NextDouble() * (hi[d] - lo[d]);
+                    vel[p][d] = (rng.NextDouble() - 0.5) * (hi[d] - lo[d]) * 0.1;
+                    pBest[p][d] = pos[p][d];
+                }
+                double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
+                pBestCost[p] = cost;
+                if (cost < gBestCost)
+                {
+                    gBestCost = cost;
+                    Array.Copy(pos[p], gBest, 3);
+                }
+            }
+
+            // 반복
+            for (int it = 0; it < maxIter; it++)
+            {
+                for (int p = 0; p < nParticles; p++)
+                {
+                    for (int d = 0; d < 3; d++)
                     {
-                        double tryTd = logTd[iTd];
-
-                        // 시뮬레이션
-                        double[] ySim = new double[simLen];
-                        double[] uSim = new double[simLen];
-                        double integ = 0;
-                        double prevE = 0;
-                        bool diverged = false;
-
-                        for (int k = 0; k < simLen; k++)
+                        double r1 = rng.NextDouble();
+                        double r2 = rng.NextDouble();
+                        vel[p][d] = w * vel[p][d]
+                                  + c1 * r1 * (pBest[p][d] - pos[p][d])
+                                  + c2 * r2 * (gBest[d] - pos[p][d]);
+                        pos[p][d] += vel[p][d];
+                        // 경계 클램핑
+                        if (pos[p][d] < lo[d]) { pos[p][d] = lo[d]; vel[p][d] = 0; }
+                        if (pos[p][d] > hi[d]) { pos[p][d] = hi[d]; vel[p][d] = 0; }
+                    }
+                    double cost = evaluate(Math.Exp(pos[p][0]), Math.Exp(pos[p][1]), Math.Exp(pos[p][2]));
+                    if (cost < pBestCost[p])
+                    {
+                        pBestCost[p] = cost;
+                        Array.Copy(pos[p], pBest[p], 3);
+                        if (cost < gBestCost)
                         {
-                            double r = 1.0; // 스텝 입력
-                            double y_k = 0;
-                            // 합성곱: y(k) = Σ h[jj] * u(k-1-jj) (인과적)
-                            for (int jj = 0; jj < hLen && jj < k; jj++)
-                                y_k += hImpulse[jj] * uSim[k - 1 - jj];
-                            // K의 부호를 고려 (역방향 플랜트면 u 부호 반전)
-                            // 여기서는 kvOrK_sign이 양수가 되도록 정규화된 모델로 가정
-                            ySim[k] = y_k * kvOrK_sign;
-
-                            double e = r - ySim[k];
-                            integ += e * dt;
-                            double deriv = (k > 0) ? (e - prevE) / dt : 0;
-                            prevE = e;
-
-                            double u_k = tryKp * (e + integ / tryTi + tryTd * deriv);
-                            // 포화
-                            if (u_k > 1.0) u_k = 1.0;
-                            else if (u_k < -1.0) u_k = -1.0;
-                            uSim[k] = u_k;
-
-                            if (double.IsNaN(ySim[k]) || double.IsInfinity(ySim[k]) || Math.Abs(ySim[k]) > 100)
-                            {
-                                diverged = true;
-                                break;
-                            }
-                        }
-
-                        if (diverged) continue;
-
-                        // 비용: ITAE (Integral of Time-weighted Absolute Error) + 오버슈트 패널티
-                        double cost = 0;
-                        double maxY = 0;
-                        for (int k = 0; k < simLen; k++)
-                        {
-                            double err = yTarget[k] - ySim[k];
-                            cost += k * dt * Math.Abs(err) * dt; // ITAE
-                            if (ySim[k] > maxY) maxY = ySim[k];
-                        }
-                        double overshoot = Math.Max(0, maxY - 1.0);
-                        cost += 10.0 * overshoot; // 오버슈트 패널티
-
-                        if (cost < bestCost)
-                        {
-                            bestCost = cost;
-                            bestKp = tryKp;
-                            bestTi = tryTi;
-                            bestTd = tryTd;
+                            gBestCost = cost;
+                            Array.Copy(pos[p], gBest, 3);
                         }
                     }
                 }
             }
+
+            bestKp = Math.Exp(gBest[0]);
+            bestTi = Math.Exp(gBest[1]);
+            bestTd = Math.Exp(gBest[2]);
+            bestCost = gBestCost;
 
             // 클램핑
             bestKp = Math.Max(0.001, Math.Min(1.0, bestKp));

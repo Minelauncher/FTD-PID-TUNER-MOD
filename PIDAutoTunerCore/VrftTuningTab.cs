@@ -1080,7 +1080,6 @@ namespace PIDAutoTuner
 
             // τ = dt 고정 (FTD 순수 지연 ≈ 1틱)
             // 폐루프에서 위상 기울기 추정은 PID 위상을 포함해 과대추정하므로 사용하지 않음
-            double tauEst = dt;
             _s.ModelDelayTau = (float)dt;
 
             // 고정 파라미터
@@ -1163,6 +1162,21 @@ namespace PIDAutoTuner
             _s.SettlingTimeTs = (float)bestTs;
             VrftResult r = bestResult;
 
+            // 모델 식별도 병행 계산 — VRFT의 Ti가 신뢰 불가일 때 대체
+            string modelMsg = "";
+            try
+            {
+                ModelPidResult mr = ComputeModelPid(u, y, dt);
+                modelMsg = $" | Model: {mr.ModelInfo} Kp={mr.Kp:0.000} Ti={mr.Ti:0.0} Td={mr.Td:0.00}";
+
+                // VRFT Ti가 fallback(IMC 규칙)을 탄 경우, 모델 식별의 Ti를 우선 사용
+                if (r.Ti <= 0.1 || r.Ti >= 100.0)
+                {
+                    r.Ti = mr.Ti;
+                }
+            }
+            catch { /* 모델 식별 실패해도 VRFT 결과는 유지 */ }
+
             _sess.HasResult = true;
             _sess.Kp = r.Kp;
             _sess.Ti = r.Ti;
@@ -1171,8 +1185,8 @@ namespace PIDAutoTuner
 
             _autoState = AutoTuneState.Done;
             _sess.LastMessage = string.IsNullOrEmpty(r.Warning)
-                ? $"Done / 완료 | τ={tauEst:0.00} Ts={bestTs:0.00} u=[{uMin:0.000},{uMax:0.000}] y=[{yMin:0.0},{yMax:0.0}]"
-                : $"Done (warning: {r.Warning}) / 완료 (경고) u=[{uMin:0.000},{uMax:0.000}] y=[{yMin:0.0},{yMax:0.0}]";
+                ? $"Done | Ts={bestTs:0.00} u=[{uMin:0.000},{uMax:0.000}] y=[{yMin:0.0},{yMax:0.0}]{modelMsg}"
+                : $"Done (warning: {r.Warning}){modelMsg}";
         }
 
         private void CaptureSetPointAdjustBase()
@@ -1621,6 +1635,200 @@ namespace PIDAutoTuner
             double rmse = Math.Sqrt(sse / Math.Max(1, L));
 
             return new VrftResult { Kp = Kp, Ti = Ti, Td = Td, Rmse = rmse, Warning = warning };
+        }
+
+        // ============================================================
+        // 주파수 응답 기반 모델 식별 + IMC-PID
+        // 폐루프 데이터에서 H(jω) = Y/U 추정 → FOPDT/IPDT 피팅 → PID 산출
+        // ============================================================
+
+        private struct ModelPidResult
+        {
+            public double Kp, Ti, Td;
+            public string ModelInfo;
+        }
+
+        private static ModelPidResult ComputeModelPid(double[] u, double[] y, double dt)
+        {
+            int N = Math.Min(u.Length, y.Length);
+            if (N < 64) throw new Exception("Too few samples");
+
+            // 디트렌드
+            double[] ud = new double[N]; Array.Copy(u, ud, N); Detrend(ud);
+            double[] yd = new double[N]; Array.Copy(y, yd, N); Detrend(yd);
+
+            // FFT
+            int Nfft = NextPow2(2 * N);
+            double fs = 1.0 / dt;
+
+            Complex[] Uf = new Complex[Nfft];
+            Complex[] Yf = new Complex[Nfft];
+            for (int i = 0; i < N; i++)
+            {
+                Uf[i] = new Complex(ud[i], 0);
+                Yf[i] = new Complex(yd[i], 0);
+            }
+            Fourier.Forward(Uf, FourierOptions.Matlab);
+            Fourier.Forward(Yf, FourierOptions.Matlab);
+
+            // H(jω) = Y/U (Wiener 정규화)
+            double maxUmag2 = 0;
+            for (int k = 0; k < Nfft; k++)
+            {
+                double m2 = Uf[k].Real * Uf[k].Real + Uf[k].Imaginary * Uf[k].Imaginary;
+                if (m2 > maxUmag2) maxUmag2 = m2;
+            }
+            double reg = maxUmag2 * 1e-4;
+
+            // 저주파~중주파 빈에서 크기와 위상 수집 (DC 제외, ~fs/4까지)
+            int maxBin = Math.Max(4, Nfft / 4);
+            List<double> freqs = new List<double>();
+            List<double> mags = new List<double>();
+            List<double> phases = new List<double>();
+            List<double> weights = new List<double>();
+
+            double prevPhase = 0;
+            double cumUnwrap = 0;
+
+            for (int k = 1; k <= maxBin; k++)
+            {
+                double m2 = Uf[k].Real * Uf[k].Real + Uf[k].Imaginary * Uf[k].Imaginary;
+                double w = m2 / (m2 + reg); // SNR 가중치
+                if (w < 0.1) continue; // SNR 너무 낮은 빈 스킵
+
+                Complex H = (Complex.Conjugate(Uf[k]) * Yf[k]) / (m2 + reg);
+                double f = (double)k * fs / Nfft;
+                double omega = 2.0 * Math.PI * f;
+                double mag = H.Magnitude;
+                double rawPhase = Math.Atan2(H.Imaginary, H.Real);
+
+                // 위상 언래핑
+                if (freqs.Count > 0)
+                {
+                    double diff = rawPhase - prevPhase;
+                    if (diff > Math.PI) cumUnwrap -= 2.0 * Math.PI;
+                    else if (diff < -Math.PI) cumUnwrap += 2.0 * Math.PI;
+                }
+                prevPhase = rawPhase;
+                double phase = rawPhase + cumUnwrap;
+
+                freqs.Add(omega);
+                mags.Add(mag);
+                phases.Add(phase);
+                weights.Add(w);
+            }
+
+            if (freqs.Count < 4) throw new Exception("Insufficient frequency data");
+
+            // ── 적분기 판별 ──
+            // 적분기: |H| ∝ 1/ω → log|H| vs logω 기울기 ≈ -1
+            // FOPDT: log|H| ≈ flat at low freq
+            double sumLF = 0, sumLM = 0, sumLFLM = 0, sumLFLF = 0, nLow = 0;
+            int lowBins = Math.Min(freqs.Count / 3, 10);
+            for (int i = 0; i < lowBins; i++)
+            {
+                double lf = Math.Log(freqs[i]);
+                double lm = Math.Log(Math.Max(1e-12, mags[i]));
+                sumLF += lf;
+                sumLM += lm;
+                sumLFLM += lf * lm;
+                sumLFLF += lf * lf;
+                nLow++;
+            }
+            double magSlope = (nLow > 1)
+                ? (sumLFLM - nLow * (sumLF / nLow) * (sumLM / nLow)) / Math.Max(1e-12, sumLFLF - nLow * (sumLF / nLow) * (sumLF / nLow))
+                : 0;
+
+            bool isIntegrator = magSlope < -0.5; // 기울기 ≈ -1이면 적분기
+
+            // ── τ (순수 지연) 추정: 위상 기울기 ──
+            // 중주파 영역에서 위상의 선형 기울기 = -(τ + 플랜트 위상)
+            // 저주파에서 추정 (플랜트 위상 영향 최소)
+            double sumWF = 0, sumWW = 0;
+            int phaseStart = isIntegrator ? 0 : lowBins; // 적분기는 저주파부터
+            int phaseEnd = Math.Min(freqs.Count, lowBins * 2);
+            for (int i = phaseStart; i < phaseEnd; i++)
+            {
+                double expectedPhase = isIntegrator ? (-Math.PI / 2.0) : 0;
+                double residual = phases[i] - expectedPhase;
+                sumWF += weights[i] * freqs[i] * residual;
+                sumWW += weights[i] * freqs[i] * freqs[i];
+            }
+            double tauDelay = (sumWW > 1e-12) ? -sumWF / sumWW : 0;
+            tauDelay = Math.Max(0, Math.Min(tauDelay, 0.5));
+
+            double kp, ti, td;
+            string modelInfo;
+
+            if (isIntegrator)
+            {
+                // ── IPDT: H(jω) = Kv/(jω) · e^(-jωτ) ──
+                // |H| = Kv/ω → Kv = |H| * ω (저주파 평균)
+                double kvSum = 0;
+                double kvW = 0;
+                for (int i = 0; i < lowBins; i++)
+                {
+                    double kv = mags[i] * freqs[i];
+                    kvSum += weights[i] * kv;
+                    kvW += weights[i];
+                }
+                double Kv = (kvW > 0) ? kvSum / kvW : 1.0;
+
+                double lambda = Math.Max(2.0 * tauDelay, 0.2);
+                kp = 1.0 / (Kv * (2.0 * tauDelay + lambda));
+                ti = 2.0 * (2.0 * tauDelay + lambda);
+                td = tauDelay;
+
+                modelInfo = $"IPDT Kv={Kv:0.000} τ={tauDelay:0.00}";
+            }
+            else
+            {
+                // ── FOPDT: H(jω) = K/(1+jωτp) · e^(-jωτ) ──
+                // K = |H(0)| ≈ 저주파 평균 크기
+                double kSum = 0, kW = 0;
+                for (int i = 0; i < lowBins; i++)
+                {
+                    kSum += weights[i] * mags[i];
+                    kW += weights[i];
+                }
+                double K = (kW > 0) ? kSum / kW : 1.0;
+
+                // τp: |H| = K/√(1+ω²τp²) → |H|² = K²/(1+ω²τp²)
+                // 선형화: 1/|H|² = 1/K² + (τp/K)² * ω²
+                // 기울기 = (τp/K)² → τp = K * √기울기
+                double sumW2 = 0, sumInvH2 = 0, sumW2InvH2 = 0, sumW2W2 = 0;
+                double nFit = 0;
+                for (int i = 0; i < freqs.Count && i < lowBins * 3; i++)
+                {
+                    if (mags[i] < 1e-12) continue;
+                    double w2 = freqs[i] * freqs[i];
+                    double invH2 = 1.0 / (mags[i] * mags[i]);
+                    sumW2 += w2;
+                    sumInvH2 += invH2;
+                    sumW2InvH2 += w2 * invH2;
+                    sumW2W2 += w2 * w2;
+                    nFit++;
+                }
+                double tpSlope = (nFit > 1)
+                    ? (sumW2InvH2 - nFit * (sumW2 / nFit) * (sumInvH2 / nFit)) / Math.Max(1e-12, sumW2W2 - nFit * (sumW2 / nFit) * (sumW2 / nFit))
+                    : 0;
+                double tauP = (tpSlope > 0) ? K * Math.Sqrt(tpSlope) : dt;
+                tauP = Math.Max(dt, tauP);
+
+                double lambda = Math.Max(tauDelay, 0.1);
+                kp = tauP / (K * (tauDelay + lambda));
+                ti = tauP;
+                td = tauDelay / 2.0;
+
+                modelInfo = $"FOPDT K={K:0.000} τp={tauP:0.00} τ={tauDelay:0.00}";
+            }
+
+            kp = Math.Abs(kp);
+            kp = Math.Max(0.001, Math.Min(1.0, kp));
+            ti = Math.Max(0.1, Math.Min(250.0, ti));
+            td = Math.Max(0.0, Math.Min(10.0, td));
+
+            return new ModelPidResult { Kp = kp, Ti = ti, Td = td, ModelInfo = modelInfo };
         }
 
         // ============================================================

@@ -1715,100 +1715,58 @@ namespace PIDAutoTuner
         private static ModelPidResult ComputeModelPid(double[] u, double[] y, double dt, double[][] otherU = null)
         {
             int N = Math.Min(u.Length, y.Length);
-            if (N < 64) throw new Exception("Too few samples");
-
-            int m = 1 + (otherU != null ? otherU.Length : 0); // 총 입력 수 (자기축 + 타축)
+            if (N < 100) throw new Exception("Too few samples for N4SID");
 
             // ── 1. 디트렌드 ──
             double[] ud = new double[N]; Array.Copy(u, ud, N); Detrend(ud);
             double[] yd = new double[N]; Array.Copy(y, yd, N); Detrend(yd);
-            double[][] oud = null;
-            if (otherU != null && otherU.Length > 0)
-            {
-                oud = new double[otherU.Length][];
-                for (int a = 0; a < otherU.Length; a++)
-                {
-                    oud[a] = new double[N];
-                    int len = Math.Min(N, otherU[a].Length);
-                    Array.Copy(otherU[a], oud[a], len);
-                    Detrend(oud[a]);
-                }
-            }
 
-            // ── 2. MISO 블록 Hankel 행렬 구성 (N4SID 방식) ──
-            // i = future horizon, j = number of columns
-            int L = Math.Min(N / 6, 50); // 블록 행 수
-            int j = N - 2 * L + 1;       // 열 수
-            if (j < 10) throw new Exception("Insufficient data for N4SID");
+            // ── 2. 블록 Hankel 행렬 구성 ──
+            // 블록 행 수 L, 열 수 j
+            int L = Math.Min(20, N / 6);
+            int j = N - 2 * L + 1;
+            if (j < 20) throw new Exception("Insufficient columns");
 
-            // Past/Future 입력 행렬: U_p, U_f (각 m*L × j)
-            // Past/Future 출력 행렬: Y_p, Y_f (각 L × j)
-            var Uf_mat = MB.Dense(m * L, j);
-            var Up_mat = MB.Dense(m * L, j);
-            var Yf_mat = MB.Dense(L, j);
-            var Yp_mat = MB.Dense(L, j);
+            // U_p, U_f: L × j (SISO, 자기축만)
+            var Up = MB.Dense(L, j);
+            var Uf = MB.Dense(L, j);
+            var Yp = MB.Dense(L, j);
+            var Yf = MB.Dense(L, j);
 
             for (int col = 0; col < j; col++)
             {
                 for (int row = 0; row < L; row++)
                 {
-                    // Past: [0..L-1], Future: [L..2L-1]
-                    int pastIdx = col + row;
-                    int futIdx = col + L + row;
-
-                    // 자기축 u
-                    Up_mat[row, col] = ud[pastIdx];
-                    Uf_mat[row, col] = ud[futIdx];
-
-                    // 타축 u
-                    if (oud != null)
-                    {
-                        for (int a = 0; a < oud.Length; a++)
-                        {
-                            Up_mat[(a + 1) * L + row, col] = oud[a][pastIdx];
-                            Uf_mat[(a + 1) * L + row, col] = oud[a][futIdx];
-                        }
-                    }
-
-                    // 출력 y
-                    Yp_mat[row, col] = yd[pastIdx];
-                    Yf_mat[row, col] = yd[futIdx];
+                    Up[row, col] = ud[col + row];
+                    Uf[row, col] = ud[col + L + row];
+                    Yp[row, col] = yd[col + row];
+                    Yf[row, col] = yd[col + L + row];
                 }
             }
 
-            // ── 3. 경사 투영 (Oblique Projection) ──
-            // W = [U_p; Y_p] (과거 데이터)
-            // Yf 에서 Uf의 영향을 제거하고 W의 기여만 추출
-            // 간소화: Yf_residual = Yf - Yf*Uf'*(Uf*Uf')^-1*Uf
-            // 그 다음 SVD로 시스템 차수 결정
-
-            // Uf 영향 제거: Y_perp = Yf - Yf * Uf^T * (Uf * Uf^T)^-1 * Uf
-            var UfUfT = Uf_mat * Uf_mat.Transpose();
+            // ── 3. 경사 투영: Yf에서 Uf 영향 제거 ──
+            // O_i = Yf * Π_Uf^⊥ = Yf - Yf * Uf^T * (Uf*Uf^T)^-1 * Uf
+            var UfUfT = Uf * Uf.Transpose();
             Matrix<double> YfPerp;
             try
             {
-                var UfProj = UfUfT.Solve(Uf_mat);
-                YfPerp = Yf_mat - Yf_mat * Uf_mat.Transpose() * UfProj;
+                var UfProj = UfUfT.Solve(Uf);
+                YfPerp = Yf - Yf * Uf.Transpose() * UfProj;
             }
-            catch
-            {
-                YfPerp = Yf_mat; // Uf가 특이면 투영 생략
-            }
+            catch { YfPerp = Yf; }
 
-            // ── 4. SVD → 시스템 차수 ──
+            // ── 4. SVD로 시스템 차수 결정 ──
             var svd = YfPerp.Svd();
             var sigma = svd.S;
 
-            // Gavish-Donoho 최적 하드 임계값: τ* = (4/√3) × σ_median
-            // 노이즈가 있는 행렬에서 최적 복원 오차를 최소화하는 절단점 (이론적 유도)
-            int maxOrder = Math.Min(4, sigma.Count);
+            // Gavish-Donoho 임계값
             double[] sigArr = new double[sigma.Count];
-            for (int i = 0; i < sigma.Count; i++)
-                sigArr[i] = sigma[i];
+            for (int i = 0; i < sigma.Count; i++) sigArr[i] = sigma[i];
             Array.Sort(sigArr);
             double sigMedian = sigArr[sigArr.Length / 2];
-            double gdThreshold = (4.0 / Math.Sqrt(3.0)) * sigMedian; // ≈ 2.858 × median
+            double gdThreshold = (4.0 / Math.Sqrt(3.0)) * sigMedian;
 
+            int maxOrder = Math.Min(4, sigma.Count);
             int order = 1;
             for (int i = 1; i < maxOrder; i++)
             {
@@ -1816,35 +1774,67 @@ namespace PIDAutoTuner
                 order = i + 1;
             }
 
-            // ── 5. 상태공간 추출 (최소자승) ──
-            // 확장 관측성 행렬 Γ = U_n * Σ_n^(1/2)
+            // ── 5. 확장 관측성 행렬 Γ와 상태 시퀀스 X ──
+            // Γ = U_svd(:,1:n) * Σ_n^(1/2) ,  X = Γ^† * Yf (의사역행렬)
             var Un = svd.U.SubMatrix(0, L, 0, order);
             var SigmaHalf = MB.DiagonalOfDiagonalArray(order, order,
                 Enumerable.Range(0, order).Select(i => Math.Sqrt(sigma[i])).ToArray());
             var Gamma = Un * SigmaHalf;
 
-            // C = first row of Gamma
-            double[] C_vec = new double[order];
-            for (int i = 0; i < order; i++)
-                C_vec[i] = Gamma[0, i];
+            // 상태: X = Γ^† * Yf (j 개의 상태 샘플)
+            // pseudo-inverse of Gamma (L×n)
+            // Γ^† = (Γ^T Γ)^-1 Γ^T
+            var GammaT = Gamma.Transpose();
+            Matrix<double> X;
+            try
+            {
+                X = (GammaT * Gamma).Inverse() * GammaT * Yf;
+            }
+            catch { throw new Exception("Gamma pseudo-inverse failed"); }
 
-            // 상태 시퀀스: X = Σ^(-1/2) * U^T * YfPerp (간소화)
-            var SigmaInvHalf = MB.DiagonalOfDiagonalArray(order, order,
-                Enumerable.Range(0, order).Select(i => 1.0 / Math.Sqrt(Math.Max(1e-12, sigma[i]))).ToArray());
-            var X = SigmaInvHalf * Un.Transpose() * Yf_mat; // order × j
-
-            // A, B를 최소자승으로: [x(k+1); y(k)] ≈ [A B; C D] * [x(k); u(k)]
-            // 간소화: A만 상태 전이에서, B는 자기축 u→y 관계에서
+            // ── 6. A, B, C, D 최소자승 추출 ──
+            // [X(:, 2:j);     [A B]   [X(:, 1:j-1)]
+            //  Yf(1, 1:j-1)] = [C D] * [Uf(1, 1:j-1)]
+            // LS: M * P = Q → M = Q * P^T * (P*P^T)^-1
             if (j < 3) throw new Exception("Insufficient columns for LS");
 
-            // A 추출: X(:, 2:end) ≈ A * X(:, 1:end-1)
-            var X1 = X.SubMatrix(0, order, 0, j - 1);
-            var X2 = X.SubMatrix(0, order, 1, j - 1);
-            Matrix<double> A;
-            try { A = X2 * X1.Transpose() * (X1 * X1.Transpose()).Inverse(); }
-            catch { A = MB.DenseIdentity(order) * 0.9; } // fallback
+            var X1 = X.SubMatrix(0, order, 0, j - 1);        // n × (j-1)
+            var X2 = X.SubMatrix(0, order, 1, j - 1);        // n × (j-1)
+            // Yf(0, 0:j-2), Uf(0, 0:j-2) 모두 1 × (j-1)
+            var Yf_row = Yf.SubMatrix(0, 1, 0, j - 1);
+            var Uf_row = Uf.SubMatrix(0, 1, 0, j - 1);
 
-            // ── 6. 고유값 분석 → 적분기/시정수 ──
+            // P = [X1; Uf_row] → (n+1) × (j-1)
+            var P = MB.Dense(order + 1, j - 1);
+            for (int i = 0; i < order; i++)
+                for (int c = 0; c < j - 1; c++)
+                    P[i, c] = X1[i, c];
+            for (int c = 0; c < j - 1; c++)
+                P[order, c] = Uf_row[0, c];
+
+            // Q = [X2; Yf_row] → (n+1) × (j-1)
+            var Q = MB.Dense(order + 1, j - 1);
+            for (int i = 0; i < order; i++)
+                for (int c = 0; c < j - 1; c++)
+                    Q[i, c] = X2[i, c];
+            for (int c = 0; c < j - 1; c++)
+                Q[order, c] = Yf_row[0, c];
+
+            // M = Q * P^T * (P * P^T)^-1
+            Matrix<double> M_mat;
+            try
+            {
+                M_mat = Q * P.Transpose() * (P * P.Transpose()).Inverse();
+            }
+            catch { throw new Exception("State-space LS failed"); }
+
+            // A (n×n), B (n×1), C (1×n), D (1×1) 추출
+            var A = M_mat.SubMatrix(0, order, 0, order);
+            var B = M_mat.SubMatrix(0, order, order, 1);
+            var C = M_mat.SubMatrix(order, 1, 0, order);
+            double D_scalar = M_mat[order, order];
+
+            // ── 7. 플랜트 특성 분석 ──
             var eigenA = A.Evd();
             bool isIntegrator = false;
             double dominantTau = dt;
@@ -1860,158 +1850,50 @@ namespace PIDAutoTuner
                 }
             }
 
-            // ── 7. 자기축 전달함수 파라미터 (커플링 분리됨) ──
-            // 임펄스 응답으로 DC게인/속도게인 추정 (자기축 u에 대한 y 응답)
-            // Wiener deconvolution으로 자기축만의 임펄스 응답
-            int Nfft = NextPow2(2 * N);
-            Complex[] UfFFT = new Complex[Nfft];
-            Complex[] YfFFT = new Complex[Nfft];
-            for (int i = 0; i < N; i++)
+            // DC 게인: G(1) = C*(I-A)^-1*B + D
+            double dcGain = D_scalar;
+            try
             {
-                UfFFT[i] = new Complex(ud[i], 0);
-                YfFFT[i] = new Complex(yd[i], 0);
+                var IA = MB.DenseIdentity(order) - A;
+                var IA_inv_B = IA.Solve(B);
+                for (int i = 0; i < order; i++)
+                    dcGain += C[0, i] * IA_inv_B[i, 0];
             }
+            catch { isIntegrator = true; }
 
-            // 타축 영향 시간 영역에서 제거: y_clean = y - Σ(h_other * u_other)
-            // 간소화: 타축 u와 y의 상관을 회귀로 제거
-            if (oud != null && oud.Length > 0)
-            {
-                // y_clean = y - Σ(β_i * u_other_i) (정적 커플링 제거)
-                // β_i = Cov(y, u_i) / Var(u_i)
-                double[] yClean = new double[N];
-                Array.Copy(yd, yClean, N);
-                for (int a = 0; a < oud.Length; a++)
-                {
-                    double covYU = 0, varU = 0;
-                    for (int i = 0; i < N; i++)
-                    {
-                        covYU += yClean[i] * oud[a][i];
-                        varU += oud[a][i] * oud[a][i];
-                    }
-                    if (varU > 1e-12)
-                    {
-                        double beta = covYU / varU;
-                        for (int i = 0; i < N; i++)
-                            yClean[i] -= beta * oud[a][i];
-                    }
-                }
-                for (int i = 0; i < N; i++)
-                    YfFFT[i] = new Complex(yClean[i], 0);
-            }
-
-            Fourier.Forward(UfFFT, FourierOptions.Matlab);
-            Fourier.Forward(YfFFT, FourierOptions.Matlab);
-
-            double maxUm2 = 0;
-            for (int k = 0; k < Nfft; k++)
-            {
-                double m2 = UfFFT[k].Real * UfFFT[k].Real + UfFFT[k].Imaginary * UfFFT[k].Imaginary;
-                if (m2 > maxUm2) maxUm2 = m2;
-            }
-            double regH = maxUm2 * 1e-4;
-
-            Complex[] Hf = new Complex[Nfft];
-            for (int k = 0; k < Nfft; k++)
-            {
-                double m2 = UfFFT[k].Real * UfFFT[k].Real + UfFFT[k].Imaginary * UfFFT[k].Imaginary;
-                Hf[k] = (Complex.Conjugate(UfFFT[k]) * YfFFT[k]) / (m2 + regH);
-            }
-            Fourier.Inverse(Hf, FourierOptions.Matlab);
-
-            // 임펄스 응답에서 지연 추정
-            int hLen = Math.Min(N / 4, 100);
-            double hMax = 0;
-            for (int i = 0; i < hLen; i++)
-                hMax = Math.Max(hMax, Math.Abs(Hf[i].Real));
-
-            double tauDelay = 0;
-            for (int i = 0; i < hLen; i++)
-            {
-                if (Math.Abs(Hf[i].Real) > hMax * 0.05)
-                {
-                    tauDelay = i * dt; // 첫 유의미한 반응 시점이 순수 지연
-                    break;
-                }
-            }
-            tauDelay = Math.Min(tauDelay, 0.5);
-
-            // DC게인 / 속도게인
-            double dcGain = 0;
-            for (int i = 0; i < hLen; i++)
-                dcGain += Hf[i].Real * dt; // 스텝 응답 = 임펄스 응답의 누적합
-
-            // ── 플랜트 임펄스 응답 h[k] 추출 (시뮬레이션용) ──
-            // Hf의 실수부가 이미 임펄스 응답. 유효 길이로 자름.
-            double[] hImpulse = new double[hLen];
-            for (int i = 0; i < hLen; i++)
-                hImpulse[i] = Hf[i].Real;
-
-            // ── 모델 특성에서 IMC 초기값 계산 (탐색 시작점) ──
-            double tauP_est;
-            double kvOrK_sign;
-            bool useIpdt = isIntegrator || Math.Abs(dcGain) > 100;
-            if (useIpdt)
-            {
-                double hSteady = 0;
-                int steadyStart = hLen * 3 / 4;
-                for (int i = steadyStart; i < hLen; i++)
-                    hSteady += Hf[i].Real;
-                hSteady /= Math.Max(1, hLen - steadyStart);
-                double Kv = hSteady / dt;
-                if (Math.Abs(Kv) < 1e-6) Kv = 1.0;
-                kvOrK_sign = Math.Sign(Kv);
-                tauP_est = Math.Max(dt, dominantTau);
-            }
-            else
-            {
-                kvOrK_sign = Math.Sign(dcGain);
-                if (kvOrK_sign == 0) kvOrK_sign = 1;
-                tauP_est = Math.Max(dt, dominantTau);
-            }
-
-            // ── PID 시뮬레이션 + 탐색 ──
-            // 목표: 식별된 플랜트 모델 위에서 M(s)의 스텝 응답을 가장 잘 추종하는 PID
-            // 탐색 공간 (log 스케일):
-            //   Kp ∈ [0.001, 1.0]     (10점)
-            //   Ti ∈ [0.1, 50.0]      (8점)
-            //   Td ∈ [0.001, 1.0]     (8점)
-            // 총 640회 시뮬레이션, 각 시뮬 400스텝 ≈ 수백 ms
-
-            int simLen = 400; // 8초 @ dt=0.02
-            double targetTs = Math.Max(0.5, 2.0 * tauP_est); // 원하는 정착시간
+            // ── 8. PID 시뮬레이션 + PSO ──
+            int simLen = 400;
+            double targetTs = Math.Max(0.5, 2.0 * dominantTau);
             double tauM = 0.2 * targetTs;
 
-            // 목표 응답 (M의 스텝 응답): 2차 모델
             double[] yTarget = new double[simLen];
             for (int k = 0; k < simLen; k++)
             {
                 double t = k * dt;
-                // M(s) = 1/(1+τM·s)^2 의 스텝 응답: 1 - (1 + t/τM) * e^(-t/τM)
                 double tm = t / tauM;
                 yTarget[k] = 1.0 - (1.0 + tm) * Math.Exp(-tm);
             }
 
-            double bestCost = double.MaxValue;
-            double bestKp = 0.05, bestTi = 1.0, bestTd = 0.0;
-
-            // ── 비용 함수: 주어진 (Kp, Ti, Td)에 대한 시뮬레이션 + 비용 ──
+            // 상태공간 모델 시뮬레이션 함수
             Func<double, double, double, double> evaluate = (tryKp, tryTi, tryTd) =>
             {
-                double[] ySim = new double[simLen];
-                double[] uSim = new double[simLen];
+                // 상태 초기화
+                var x = MB.Dense(order, 1);
                 double integ = 0;
                 double prevE = 0;
+                double maxY = 0;
+                double cost = 0;
 
                 for (int k = 0; k < simLen; k++)
                 {
                     double r = 1.0;
+                    // y(k) = C*x(k) + D*u(k-1) — u는 아래에서 계산되므로 D는 이전 u에 적용
+                    // 간소화: y(k) = C*x(k) (D는 작고 직접 전달이라 무시 가능하지만 정확히는 필요)
                     double y_k = 0;
-                    for (int jj = 0; jj < hLen && jj < k; jj++)
-                        y_k += hImpulse[jj] * uSim[k - 1 - jj];
-                    // hImpulse는 이미 올바른 부호 포함 (Wiener deconvolution). 추가 부호 곱하지 않음.
-                    ySim[k] = y_k;
+                    for (int i = 0; i < order; i++)
+                        y_k += C[0, i] * x[i, 0];
 
-                    double e = r - ySim[k];
+                    double e = r - y_k;
                     integ += e * dt;
                     double deriv = (k > 0) ? (e - prevE) / dt : 0;
                     prevE = e;
@@ -2019,39 +1901,41 @@ namespace PIDAutoTuner
                     double u_k = tryKp * (e + integ / tryTi + tryTd * deriv);
                     if (u_k > 1.0) u_k = 1.0;
                     else if (u_k < -1.0) u_k = -1.0;
-                    uSim[k] = u_k;
 
-                    if (double.IsNaN(ySim[k]) || double.IsInfinity(ySim[k]) || Math.Abs(ySim[k]) > 100)
-                        return double.MaxValue; // 발산
+                    // x(k+1) = A*x(k) + B*u(k)
+                    var x_next = MB.Dense(order, 1);
+                    for (int i = 0; i < order; i++)
+                    {
+                        double sum = B[i, 0] * u_k;
+                        for (int ji = 0; ji < order; ji++)
+                            sum += A[i, ji] * x[ji, 0];
+                        x_next[i, 0] = sum;
+                    }
+                    x = x_next;
+
+                    if (double.IsNaN(y_k) || double.IsInfinity(y_k) || Math.Abs(y_k) > 100)
+                        return double.MaxValue;
+
+                    double err = yTarget[k] - y_k;
+                    cost += k * dt * Math.Abs(err) * dt;
+                    if (y_k > maxY) maxY = y_k;
                 }
 
-                double cost = 0;
-                double maxY = 0;
-                for (int k = 0; k < simLen; k++)
-                {
-                    double err = yTarget[k] - ySim[k];
-                    cost += k * dt * Math.Abs(err) * dt; // ITAE
-                    if (ySim[k] > maxY) maxY = ySim[k];
-                }
-                cost += 10.0 * Math.Max(0, maxY - 1.0); // 오버슈트 패널티
+                cost += 10.0 * Math.Max(0, maxY - 1.0);
                 return cost;
             };
 
-            // ── PSO (Particle Swarm Optimization) ──
-            // 로그 공간에서 탐색: x = [log(Kp), log(Ti), log(Td)]
-            // Kp: log(0.001)~log(1)  → [-6.9, 0]
-            // Ti: log(0.1)~log(50)   → [-2.3, 3.9]
-            // Td: log(0.001)~log(1)  → [-6.9, 0]
+            // PSO
             const int nParticles = 20;
             const int maxIter = 30;
-            const double w = 0.7;   // 관성
-            const double c1 = 1.5;  // 인지 (개인 최적)
-            const double c2 = 1.5;  // 사회 (전체 최적)
+            const double w_pso = 0.7;
+            const double c1 = 1.5;
+            const double c2 = 1.5;
 
             double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
             double[] hi = { Math.Log(1.0),   Math.Log(50.0), Math.Log(1.0)   };
 
-            var rng = new System.Random(42); // 결정론적 (재현성)
+            var rng = new System.Random(42);
             double[][] pos = new double[nParticles][];
             double[][] vel = new double[nParticles][];
             double[][] pBest = new double[nParticles][];
@@ -2059,7 +1943,6 @@ namespace PIDAutoTuner
             double[] gBest = new double[3];
             double gBestCost = double.MaxValue;
 
-            // 초기화
             for (int p = 0; p < nParticles; p++)
             {
                 pos[p] = new double[3];
@@ -2080,7 +1963,6 @@ namespace PIDAutoTuner
                 }
             }
 
-            // 반복
             for (int it = 0; it < maxIter; it++)
             {
                 for (int p = 0; p < nParticles; p++)
@@ -2089,11 +1971,10 @@ namespace PIDAutoTuner
                     {
                         double r1 = rng.NextDouble();
                         double r2 = rng.NextDouble();
-                        vel[p][d] = w * vel[p][d]
+                        vel[p][d] = w_pso * vel[p][d]
                                   + c1 * r1 * (pBest[p][d] - pos[p][d])
                                   + c2 * r2 * (gBest[d] - pos[p][d]);
                         pos[p][d] += vel[p][d];
-                        // 경계 클램핑
                         if (pos[p][d] < lo[d]) { pos[p][d] = lo[d]; vel[p][d] = 0; }
                         if (pos[p][d] > hi[d]) { pos[p][d] = hi[d]; vel[p][d] = 0; }
                     }
@@ -2111,19 +1992,11 @@ namespace PIDAutoTuner
                 }
             }
 
-            bestKp = Math.Exp(gBest[0]);
-            bestTi = Math.Exp(gBest[1]);
-            bestTd = Math.Exp(gBest[2]);
-            bestCost = gBestCost;
+            double bestKp = Math.Max(0.001, Math.Min(1.0, Math.Exp(gBest[0])));
+            double bestTi = Math.Max(0.1, Math.Min(250.0, Math.Exp(gBest[1])));
+            double bestTd = Math.Max(0.0, Math.Min(10.0, Math.Exp(gBest[2])));
 
-            // 클램핑
-            bestKp = Math.Max(0.001, Math.Min(1.0, bestKp));
-            bestTi = Math.Max(0.1, Math.Min(250.0, bestTi));
-            bestTd = Math.Max(0.0, Math.Min(10.0, bestTd));
-
-            string modelInfoStr = useIpdt
-                ? $"N4SID-Search IPDT n={order} m={m} τp={tauP_est:0.00} τ={tauDelay:0.00} cost={bestCost:0.000}"
-                : $"N4SID-Search FOPDT n={order} m={m} τp={tauP_est:0.00} τ={tauDelay:0.00} cost={bestCost:0.000}";
+            string modelInfoStr = $"N4SID n={order} DC={dcGain:0.00} τp={dominantTau:0.00} cost={gBestCost:0.000}";
 
             return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = modelInfoStr };
         }

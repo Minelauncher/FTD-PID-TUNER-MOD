@@ -235,6 +235,9 @@ namespace PIDAutoTuner
             public readonly List<double> U = new List<double>();  // 제어 출력 기록
             public readonly List<double> Y = new List<double>();  // 프로세스 변수 기록
 
+            // MISO N4SID용: 다른 축의 u 기록 (커플링 분리)
+            public readonly List<List<double>> OtherU = new List<List<double>>();
+
             // ── 블록 관리 ──
             // 포화 샘플을 버리면 시계열에 "구멍"이 생김.
             // 구멍이 있는 데이터를 FFT하면 시간 정합이 깨짐.
@@ -271,6 +274,7 @@ namespace PIDAutoTuner
                 T = 0;
                 U.Clear();
                 Y.Clear();
+                OtherU.Clear();
                 BlockStarts.Clear();
                 BlockStarts.Add(0);
                 NeedNewBlock = false;
@@ -299,6 +303,20 @@ namespace PIDAutoTuner
         private readonly Session _sess = new Session();
         private AutoTuneState _autoState = AutoTuneState.Idle;
         private OpenLoopCollector _openLoopCollector = null;
+
+        // 다른 축 Controller (MISO N4SID용 커플링 분석)
+        private readonly List<VariableControllerMaster> _otherAxes = new List<VariableControllerMaster>();
+
+        /// <summary>다른 축 Controller를 등록 (패치에서 호출)</summary>
+        public void SetOtherAxes(params VariableControllerMaster[] axes)
+        {
+            _otherAxes.Clear();
+            foreach (var ax in axes)
+            {
+                if (ax != null && ax != this._focus)
+                    _otherAxes.Add(ax);
+            }
+        }
 
         // 가진 적용 시 원래 SetPoint를 백업해두고, 녹화 끝나면 복원하기 위한 변수.
         // SetPointAdjust = FTD에서 PID의 목표값을 외부에서 조절하는 파라미터.
@@ -614,6 +632,16 @@ namespace PIDAutoTuner
 
                 _sess.U.Add(u);
                 _sess.Y.Add(y);
+
+                // 다른 축 u도 기록 (MISO N4SID용)
+                while (_sess.OtherU.Count < _otherAxes.Count)
+                    _sess.OtherU.Add(new List<double>());
+                for (int ai = 0; ai < _otherAxes.Count; ai++)
+                {
+                    IVariableController oc = _otherAxes[ai].GetCurrentController();
+                    _sess.OtherU[ai].Add(oc != null ? oc.LastControlVariable : 0);
+                }
+
                 _sess.T += dt;
 
                 if (_sess.U.Count % 240 == 0)
@@ -1167,7 +1195,15 @@ namespace PIDAutoTuner
             string modelMsg = "";
             try
             {
-                ModelPidResult mr = ComputeModelPid(u, y, dt);
+                // 다른 축 u 데이터 준비 (최장 블록과 동일 구간)
+                double[][] otherU = new double[_sess.OtherU.Count][];
+                for (int ai = 0; ai < _sess.OtherU.Count; ai++)
+                {
+                    otherU[ai] = new double[blkLen];
+                    if (_sess.OtherU[ai].Count >= blkStart + blkLen)
+                        _sess.OtherU[ai].CopyTo(blkStart, otherU[ai], 0, blkLen);
+                }
+                ModelPidResult mr = ComputeModelPid(u, y, dt, otherU);
                 modelMsg = $" | Model: {mr.ModelInfo} Kp={mr.Kp:0.000} Ti={mr.Ti:0.0} Td={mr.Td:0.00}";
 
                 // VRFT Ti가 fallback(IMC 규칙)을 탄 경우, 모델 식별의 Ti를 우선 사용
@@ -1639,8 +1675,9 @@ namespace PIDAutoTuner
         }
 
         // ============================================================
-        // ERA (Eigensystem Realization Algorithm) 기반 서브스페이스 모델 식별
-        // 임펄스 응답 → Hankel 행렬 → SVD → 상태공간(A,B,C,D) → IMC-PID
+        // MISO N4SID 서브스페이스 모델 식별
+        // 다중 입력(자기축 u + 타축 u) → 단일 출력(y) → 커플링 분리
+        // Hankel 행렬 → SVD → 상태공간(A,B,C,D) → IMC-PID (자기축만)
         // ============================================================
 
         private struct ModelPidResult
@@ -1649,143 +1686,213 @@ namespace PIDAutoTuner
             public string ModelInfo;
         }
 
-        private static ModelPidResult ComputeModelPid(double[] u, double[] y, double dt)
+        private static ModelPidResult ComputeModelPid(double[] u, double[] y, double dt, double[][] otherU = null)
         {
             int N = Math.Min(u.Length, y.Length);
             if (N < 64) throw new Exception("Too few samples");
 
-            // ── 1. 임펄스 응답 추정 (Wiener deconvolution) ──
+            int m = 1 + (otherU != null ? otherU.Length : 0); // 총 입력 수 (자기축 + 타축)
+
+            // ── 1. 디트렌드 ──
             double[] ud = new double[N]; Array.Copy(u, ud, N); Detrend(ud);
             double[] yd = new double[N]; Array.Copy(y, yd, N); Detrend(yd);
-
-            int Nfft = NextPow2(2 * N);
-            Complex[] Uf = new Complex[Nfft];
-            Complex[] Yf = new Complex[Nfft];
-            for (int i = 0; i < N; i++)
+            double[][] oud = null;
+            if (otherU != null && otherU.Length > 0)
             {
-                Uf[i] = new Complex(ud[i], 0);
-                Yf[i] = new Complex(yd[i], 0);
-            }
-            Fourier.Forward(Uf, FourierOptions.Matlab);
-            Fourier.Forward(Yf, FourierOptions.Matlab);
-
-            double maxUmag2 = 0;
-            for (int k = 0; k < Nfft; k++)
-            {
-                double m2 = Uf[k].Real * Uf[k].Real + Uf[k].Imaginary * Uf[k].Imaginary;
-                if (m2 > maxUmag2) maxUmag2 = m2;
-            }
-            double reg = maxUmag2 * 1e-4;
-
-            Complex[] Hf = new Complex[Nfft];
-            for (int k = 0; k < Nfft; k++)
-            {
-                double m2 = Uf[k].Real * Uf[k].Real + Uf[k].Imaginary * Uf[k].Imaginary;
-                Hf[k] = (Complex.Conjugate(Uf[k]) * Yf[k]) / (m2 + reg);
-            }
-            Fourier.Inverse(Hf, FourierOptions.Matlab);
-
-            // Markov 파라미터 h[k] = 임펄스 응답
-            int L = Math.Min(N / 4, 100); // Hankel 행렬 블록 크기
-            double[] h = new double[2 * L];
-            for (int i = 0; i < 2 * L; i++)
-                h[i] = Hf[i].Real;
-
-            // ── 2. Hankel 행렬 구성 ──
-            // H0[i,j] = h[i+j+1], H1[i,j] = h[i+j+2]
-            var H0 = MB.Dense(L, L);
-            var H1 = MB.Dense(L, L);
-            for (int i = 0; i < L; i++)
-            {
-                for (int j = 0; j < L; j++)
+                oud = new double[otherU.Length][];
+                for (int a = 0; a < otherU.Length; a++)
                 {
-                    int idx0 = i + j + 1;
-                    int idx1 = i + j + 2;
-                    H0[i, j] = (idx0 < 2 * L) ? h[idx0] : 0;
-                    H1[i, j] = (idx1 < 2 * L) ? h[idx1] : 0;
+                    oud[a] = new double[N];
+                    int len = Math.Min(N, otherU[a].Length);
+                    Array.Copy(otherU[a], oud[a], len);
+                    Detrend(oud[a]);
                 }
             }
 
-            // ── 3. SVD → 시스템 차수 결정 ──
-            var svd = H0.Svd();
+            // ── 2. MISO 블록 Hankel 행렬 구성 (N4SID 방식) ──
+            // i = future horizon, j = number of columns
+            int L = Math.Min(N / 6, 50); // 블록 행 수
+            int j = N - 2 * L + 1;       // 열 수
+            if (j < 10) throw new Exception("Insufficient data for N4SID");
+
+            // Past/Future 입력 행렬: U_p, U_f (각 m*L × j)
+            // Past/Future 출력 행렬: Y_p, Y_f (각 L × j)
+            var Uf_mat = MB.Dense(m * L, j);
+            var Up_mat = MB.Dense(m * L, j);
+            var Yf_mat = MB.Dense(L, j);
+            var Yp_mat = MB.Dense(L, j);
+
+            for (int col = 0; col < j; col++)
+            {
+                for (int row = 0; row < L; row++)
+                {
+                    // Past: [0..L-1], Future: [L..2L-1]
+                    int pastIdx = col + row;
+                    int futIdx = col + L + row;
+
+                    // 자기축 u
+                    Up_mat[row, col] = ud[pastIdx];
+                    Uf_mat[row, col] = ud[futIdx];
+
+                    // 타축 u
+                    if (oud != null)
+                    {
+                        for (int a = 0; a < oud.Length; a++)
+                        {
+                            Up_mat[(a + 1) * L + row, col] = oud[a][pastIdx];
+                            Uf_mat[(a + 1) * L + row, col] = oud[a][futIdx];
+                        }
+                    }
+
+                    // 출력 y
+                    Yp_mat[row, col] = yd[pastIdx];
+                    Yf_mat[row, col] = yd[futIdx];
+                }
+            }
+
+            // ── 3. 경사 투영 (Oblique Projection) ──
+            // W = [U_p; Y_p] (과거 데이터)
+            // Yf 에서 Uf의 영향을 제거하고 W의 기여만 추출
+            // 간소화: Yf_residual = Yf - Yf*Uf'*(Uf*Uf')^-1*Uf
+            // 그 다음 SVD로 시스템 차수 결정
+
+            // Uf 영향 제거: Y_perp = Yf - Yf * Uf^T * (Uf * Uf^T)^-1 * Uf
+            var UfUfT = Uf_mat * Uf_mat.Transpose();
+            Matrix<double> YfPerp;
+            try
+            {
+                var UfProj = UfUfT.Solve(Uf_mat);
+                YfPerp = Yf_mat - Yf_mat * Uf_mat.Transpose() * UfProj;
+            }
+            catch
+            {
+                YfPerp = Yf_mat; // Uf가 특이면 투영 생략
+            }
+
+            // ── 4. SVD → 시스템 차수 ──
+            var svd = YfPerp.Svd();
             var sigma = svd.S;
 
-            // 차수: 특이값 급감 지점 (최대 4차)
             int maxOrder = Math.Min(4, sigma.Count);
             int order = 1;
             for (int i = 1; i < maxOrder; i++)
             {
-                if (sigma[i] < sigma[0] * 0.01) break; // 1%보다 작으면 절단
+                if (sigma[i] < sigma[0] * 0.01) break;
                 order = i + 1;
             }
 
-            // ── 4. ERA: 상태공간 모델 추출 ──
-            // Γ = U_n * Σ_n^(1/2),  O = Σ_n^(1/2) * V_n^T
-            // A = Σ_n^(-1/2) * U_n^T * H1 * V_n * Σ_n^(-1/2)
-            // C = first row of Γ
-            // B = first column of O
-
+            // ── 5. 상태공간 추출 (최소자승) ──
+            // 확장 관측성 행렬 Γ = U_n * Σ_n^(1/2)
             var Un = svd.U.SubMatrix(0, L, 0, order);
-            var Vn = svd.VT.SubMatrix(0, order, 0, L).Transpose();
             var SigmaHalf = MB.DiagonalOfDiagonalArray(order, order,
                 Enumerable.Range(0, order).Select(i => Math.Sqrt(sigma[i])).ToArray());
+            var Gamma = Un * SigmaHalf;
+
+            // C = first row of Gamma
+            double[] C_vec = new double[order];
+            for (int i = 0; i < order; i++)
+                C_vec[i] = Gamma[0, i];
+
+            // 상태 시퀀스: X = Σ^(-1/2) * U^T * YfPerp (간소화)
             var SigmaInvHalf = MB.DiagonalOfDiagonalArray(order, order,
                 Enumerable.Range(0, order).Select(i => 1.0 / Math.Sqrt(Math.Max(1e-12, sigma[i]))).ToArray());
+            var X = SigmaInvHalf * Un.Transpose() * Yf_mat; // order × j
 
-            var A = SigmaInvHalf * Un.Transpose() * H1 * Vn * SigmaInvHalf;
-            var Gamma = Un * SigmaHalf;
-            var Obs = SigmaHalf * Vn.Transpose();
+            // A, B를 최소자승으로: [x(k+1); y(k)] ≈ [A B; C D] * [x(k); u(k)]
+            // 간소화: A만 상태 전이에서, B는 자기축 u→y 관계에서
+            if (j < 3) throw new Exception("Insufficient columns for LS");
 
-            // C = first row of Gamma, B = first column of Obs
-            double C_val = Gamma[0, 0]; // SISO: C는 스칼라 (1×n의 첫 행)
-            double[] C_vec = new double[order];
-            double[] B_vec = new double[order];
-            for (int i = 0; i < order; i++)
-            {
-                C_vec[i] = Gamma[0, i];
-                B_vec[i] = Obs[i, 0];
-            }
-            double D_val = h[0]; // 직접 전달
+            // A 추출: X(:, 2:end) ≈ A * X(:, 1:end-1)
+            var X1 = X.SubMatrix(0, order, 0, j - 1);
+            var X2 = X.SubMatrix(0, order, 1, j - 1);
+            Matrix<double> A;
+            try { A = X2 * X1.Transpose() * (X1 * X1.Transpose()).Inverse(); }
+            catch { A = MB.DenseIdentity(order) * 0.9; } // fallback
 
-            // ── 5. 상태공간 모델에서 PID 파라미터 추출 ──
-            // 적분기 판별: A의 고유값 중 1에 가까운 것이 있으면 적분기
+            // ── 6. 고유값 분석 → 적분기/시정수 ──
             var eigenA = A.Evd();
             bool isIntegrator = false;
-            double dominantPole = 0;
             double dominantTau = dt;
             for (int i = 0; i < order; i++)
             {
-                double eigReal = eigenA.EigenValues[i].Real;
                 double eigMag = eigenA.EigenValues[i].Magnitude;
-                if (eigMag > 0.99) isIntegrator = true; // z-평면에서 |λ| ≈ 1 = 적분기
-                // 지배적 극점 (가장 느린 = |λ|가 가장 큰 안정 극점)
-                if (eigReal > dominantPole && eigReal < 1.0)
+                double eigReal = eigenA.EigenValues[i].Real;
+                if (eigMag > 0.99) isIntegrator = true;
+                if (eigReal > 0 && eigReal < 1.0 && eigMag > 0.5)
                 {
-                    dominantPole = eigReal;
-                    // z-평면 극점 → 연속시간 시정수: τ = -dt / ln(|λ|)
-                    dominantTau = -dt / Math.Log(Math.Max(1e-12, eigMag));
+                    double tau_i = -dt / Math.Log(Math.Max(1e-12, eigMag));
+                    if (tau_i > dominantTau) dominantTau = tau_i;
                 }
             }
 
-            // DC 게인: G(1) = C*(I-A)^(-1)*B + D (z=1)
-            var I_A = MB.DenseIdentity(order) - A;
-            double dcGain = D_val;
-            try
+            // ── 7. 자기축 전달함수 파라미터 (커플링 분리됨) ──
+            // 임펄스 응답으로 DC게인/속도게인 추정 (자기축 u에 대한 y 응답)
+            // Wiener deconvolution으로 자기축만의 임펄스 응답
+            int Nfft = NextPow2(2 * N);
+            Complex[] UfFFT = new Complex[Nfft];
+            Complex[] YfFFT = new Complex[Nfft];
+            for (int i = 0; i < N; i++)
             {
-                var x_dc = I_A.Solve(VB.DenseOfArray(B_vec));
-                for (int i = 0; i < order; i++)
-                    dcGain += C_vec[i] * x_dc[i];
+                UfFFT[i] = new Complex(ud[i], 0);
+                YfFFT[i] = new Complex(yd[i], 0);
             }
-            catch { /* I-A가 특이 = 적분기 → dcGain = ∞ */ isIntegrator = true; }
 
-            // 순수 지연: 임펄스 응답에서 첫 유의미한 반응까지
-            double tauDelay = 0;
-            double hMax = 0;
-            for (int i = 0; i < L; i++)
-                hMax = Math.Max(hMax, Math.Abs(h[i]));
-            for (int i = 0; i < L; i++)
+            // 타축 영향 시간 영역에서 제거: y_clean = y - Σ(h_other * u_other)
+            // 간소화: 타축 u와 y의 상관을 회귀로 제거
+            if (oud != null && oud.Length > 0)
             {
-                if (Math.Abs(h[i]) > hMax * 0.05)
+                // y_clean = y - Σ(β_i * u_other_i) (정적 커플링 제거)
+                // β_i = Cov(y, u_i) / Var(u_i)
+                double[] yClean = new double[N];
+                Array.Copy(yd, yClean, N);
+                for (int a = 0; a < oud.Length; a++)
+                {
+                    double covYU = 0, varU = 0;
+                    for (int i = 0; i < N; i++)
+                    {
+                        covYU += yClean[i] * oud[a][i];
+                        varU += oud[a][i] * oud[a][i];
+                    }
+                    if (varU > 1e-12)
+                    {
+                        double beta = covYU / varU;
+                        for (int i = 0; i < N; i++)
+                            yClean[i] -= beta * oud[a][i];
+                    }
+                }
+                for (int i = 0; i < N; i++)
+                    YfFFT[i] = new Complex(yClean[i], 0);
+            }
+
+            Fourier.Forward(UfFFT, FourierOptions.Matlab);
+            Fourier.Forward(YfFFT, FourierOptions.Matlab);
+
+            double maxUm2 = 0;
+            for (int k = 0; k < Nfft; k++)
+            {
+                double m2 = UfFFT[k].Real * UfFFT[k].Real + UfFFT[k].Imaginary * UfFFT[k].Imaginary;
+                if (m2 > maxUm2) maxUm2 = m2;
+            }
+            double regH = maxUm2 * 1e-4;
+
+            Complex[] Hf = new Complex[Nfft];
+            for (int k = 0; k < Nfft; k++)
+            {
+                double m2 = UfFFT[k].Real * UfFFT[k].Real + UfFFT[k].Imaginary * UfFFT[k].Imaginary;
+                Hf[k] = (Complex.Conjugate(UfFFT[k]) * YfFFT[k]) / (m2 + regH);
+            }
+            Fourier.Inverse(Hf, FourierOptions.Matlab);
+
+            // 임펄스 응답에서 지연 추정
+            int hLen = Math.Min(N / 4, 100);
+            double hMax = 0;
+            for (int i = 0; i < hLen; i++)
+                hMax = Math.Max(hMax, Math.Abs(Hf[i].Real));
+
+            double tauDelay = 0;
+            for (int i = 0; i < hLen; i++)
+            {
+                if (Math.Abs(Hf[i].Real) > hMax * 0.05)
                 {
                     tauDelay = Math.Max(0, (i - 1)) * dt;
                     break;
@@ -1793,18 +1900,23 @@ namespace PIDAutoTuner
             }
             tauDelay = Math.Min(tauDelay, 0.5);
 
+            // DC게인 / 속도게인
+            double dcGain = 0;
+            for (int i = 0; i < hLen; i++)
+                dcGain += Hf[i].Real * dt; // 스텝 응답 = 임펄스 응답의 누적합
+
             double kp, ti, td;
             string modelInfo;
 
-            if (isIntegrator || Math.Abs(dcGain) > 1000)
+            if (isIntegrator || Math.Abs(dcGain) > 100)
             {
-                // IPDT: 속도 게인 = 임펄스 응답의 정상상태 값 / dt
+                // IPDT: 속도 게인
                 double hSteady = 0;
-                int steadyStart = Math.Min(L - 1, L * 3 / 4);
-                for (int i = steadyStart; i < L; i++)
-                    hSteady += h[i];
-                hSteady /= Math.Max(1, L - steadyStart);
-                double Kv = hSteady / dt; // 적분기의 속도 게인
+                int steadyStart = hLen * 3 / 4;
+                for (int i = steadyStart; i < hLen; i++)
+                    hSteady += Hf[i].Real;
+                hSteady /= Math.Max(1, hLen - steadyStart);
+                double Kv = hSteady / dt;
                 if (Math.Abs(Kv) < 1e-6) Kv = 1.0;
 
                 double lambda = Math.Max(2.0 * tauDelay, 0.2);
@@ -1812,11 +1924,10 @@ namespace PIDAutoTuner
                 ti = 2.0 * (2.0 * tauDelay + lambda);
                 td = tauDelay;
 
-                modelInfo = $"ERA-IPDT n={order} Kv={Kv:0.000} τ={tauDelay:0.00}";
+                modelInfo = $"N4SID-IPDT n={order} m={m} Kv={Kv:0.000} τ={tauDelay:0.00}";
             }
             else
             {
-                // FOPDT: DC게인과 지배적 시정수
                 double K = dcGain;
                 double tauP = Math.Max(dt, dominantTau);
 
@@ -1825,7 +1936,7 @@ namespace PIDAutoTuner
                 ti = tauP;
                 td = tauDelay / 2.0;
 
-                modelInfo = $"ERA-FOPDT n={order} K={K:0.000} τp={tauP:0.00} τ={tauDelay:0.00}";
+                modelInfo = $"N4SID-FOPDT n={order} m={m} K={K:0.000} τp={tauP:0.00} τ={tauDelay:0.00}";
             }
 
             kp = Math.Abs(kp);

@@ -1568,95 +1568,31 @@ namespace PIDAutoTuner
             _s.SettlingTimeTs = (float)bestTs;
             VrftResult vrft = bestResult;
 
-            // 3-way 식별 + 교차검증 RMSE 기반 선택.
-            //   이전: PEM=innovRms/stdY, BLA=1-γ² → 스케일 불일치 (시간/주파수 도메인 혼재).
-            //   개선: 데이터 80%로 식별, 20%로 교차검증 RMSE 계산 → 동일 단위 공정 비교.
-            //   교차검증 불가 시 (데이터 부족) 기존 방식 fallback.
+            // 3-way 식별: PEM / BLA / VRFT 모두 계산 후 신뢰도로 정렬.
+            //   PEM identRatio = innovRms / std(y): 모델 예측 품질 (낮을수록 좋음)
+            //   BLA identRatio = 1 - mean(γ²): FRF 코히런스 (낮을수록 좋음)
+            //   VRFT: 항상 0.99 (안전망)
+            // 교차검증 RMSE 는 BLA 에 부적합 (12빈 비파라미터 → 시간도메인 재구성 불가).
+            // 데이터 분할도 식별 품질 저하 유발 → 전체 데이터로 식별.
             const double IDENT_THRESHOLD = 0.5;
-
-            // ── 데이터 분할: 80% 식별 / 20% 교차검증 ──
-            int valLen = Math.Max(100, blkLen / 5);
-            bool canCrossVal = (blkLen - valLen) >= 200; // 식별 데이터 최소 200
-            int idLen = canCrossVal ? (blkLen - valLen) : blkLen;
-
-            double[] uId = canCrossVal ? new double[idLen] : u;
-            double[] yId = canCrossVal ? new double[idLen] : y;
-            double[] rId = null;
-            double[] uVal = null, yVal = null;
-            double stdYVal = 0;
-
-            if (canCrossVal)
-            {
-                Array.Copy(u, 0, uId, 0, idLen);
-                Array.Copy(y, 0, yId, 0, idLen);
-                if (r.Length == blkLen)
-                {
-                    rId = new double[idLen];
-                    Array.Copy(r, 0, rId, 0, idLen);
-                }
-                uVal = new double[valLen];
-                yVal = new double[valLen];
-                Array.Copy(u, idLen, uVal, 0, valLen);
-                Array.Copy(y, idLen, yVal, 0, valLen);
-                stdYVal = StdDev(yVal);
-                if (stdYVal < 1e-10) canCrossVal = false; // 검증 구간 변동 없으면 무의미
-            }
-            if (r.Length == blkLen && rId == null && canCrossVal)
-                rId = r; // fallback: 전체 r 사용 (cross-val 안 할 때)
 
             ModelPidResult pemResult = default;
             ModelPidResult blaResult = default;
             bool pemOk = false, blaOk = false;
             string pemInfo = "", blaInfo = "";
 
-            try { pemResult = ComputePemPid(uId, yId, dt); pemOk = true; pemInfo = pemResult.ModelInfo; }
+            try { pemResult = ComputePemPid(u, y, dt); pemOk = true; pemInfo = pemResult.ModelInfo; }
             catch (Exception ex) { pemInfo = $"PEM failed: {ex.Message}"; }
 
             // BLA 는 r 데이터 있을 때만
-            // r 배열은 원본 블록 기준으로 추출됨. 교차검증 시 식별 부분만 사용.
             if (r.Length > 0)
             {
-                double[] rBla;
-                if (canCrossVal)
-                {
-                    rBla = new double[idLen];
-                    Array.Copy(r, 0, rBla, 0, Math.Min(r.Length, idLen));
-                }
-                else
-                {
-                    rBla = r;
-                }
-                try { blaResult = ComputeBlaPid(uId, yId, rBla, dt, _s); blaOk = true; blaInfo = blaResult.ModelInfo; }
+                try { blaResult = ComputeBlaPid(u, y, r, dt, _s); blaOk = true; blaInfo = blaResult.ModelInfo; }
                 catch (Exception ex) { blaInfo = $"BLA failed: {ex.Message}"; }
             }
             else
             {
                 blaInfo = "BLA skipped: no excitation data";
-            }
-
-            // ── 교차검증 RMSE 계산 (동일 스케일 비교) ──
-            if (canCrossVal && stdYVal > 1e-10)
-            {
-                if (pemOk && pemResult.PemModel != null)
-                {
-                    double pemCvRmse = PemCrossValRmse(pemResult.PemModel, uVal, yVal);
-                    if (!double.IsNaN(pemCvRmse))
-                    {
-                        pemResult.IdentRatio = pemCvRmse / stdYVal;
-                        pemInfo += $" cv={pemResult.IdentRatio:0.00}";
-                        pemResult.ModelInfo = pemInfo;
-                    }
-                }
-                if (blaOk && blaResult.BlaFrf != null)
-                {
-                    double blaCvRmse = BlaCrossValRmse(blaResult.BlaFrf, uVal, yVal, dt);
-                    if (!double.IsNaN(blaCvRmse))
-                    {
-                        blaResult.IdentRatio = blaCvRmse / stdYVal;
-                        blaInfo += $" cv={blaResult.IdentRatio:0.00}";
-                        blaResult.ModelInfo = blaInfo;
-                    }
-                }
             }
 
             string vrftInfo = $"VRFT Ts={bestTs:0.00} rmse={vrft.Rmse:0.00e0}";

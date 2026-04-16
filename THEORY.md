@@ -278,6 +278,8 @@ $$F(s) = M(s)(1 - M(s))W(s)$$
 
 **밴드패스 결과:** `F`는 DC에서 0, 중간에서 피크, 고주파에서 감소. 회귀가 PID가 가장 중요한 곳에 집중.
 
+> **주의:** `F(0) = 0` 은 DC 정보를 제거하므로 **`T_i` 추정의 분산이 구조적으로 큼** — §8 참조. VRFT 의 Ti 가 불안정할 때 IMC 규칙 또는 PEM/BLA 결과 사용 권장.
+
 ### 5.3 가중 필터 W
 
 $$W(s) = \frac{\omega_W}{s + \omega_W}, \quad \omega_W = 2\pi f_W, \quad f_W = f_s / 8$$
@@ -440,6 +442,23 @@ $$\hat{G}_{LS} \to G - \frac{K \cdot \sigma_v^2}{(1+GK) \cdot \sigma_u^2} \neq G
 | **BLA** | 가진 `r` 을 도구변수로 사용 + Welch 평균 → `E[noise · r] = 0` 으로 상관 소거. |
 | **VRFT** | 플랜트 `G` 자체를 추정 안 함 → 편향 개념 미적용. 데이터 → PID 직접 회귀. |
 
+### 자동 선택 지표: IdentRatio
+
+세 방법 모두 실행 후, **IdentRatio** 로 정렬하여 가장 신뢰도 높은 결과를 Active (주력), 2순위를 Alternative (대안) 으로 표시. 사용자는 Swap 버튼으로 교체 가능.
+
+| 방법 | IdentRatio 정의 | 의미 | 범위 |
+|------|----------------|------|------|
+| **PEM** | `√V(θ) / std(y)` = 혁신 RMS / 출력 표준편차 | 모델이 y 를 얼마나 잘 예측하나 | 0 = 완벽 |
+| **BLA** | `1 - mean(γ²)` = 1 - 평균 coherence | FRF 의 r↔y 선형 종속 강도 | 0 = 완벽 |
+| **VRFT** | 고정 0.99 | 항상 최하위 (안전망) | 0.99 |
+
+선택 규칙:
+- IdentRatio < 0.5 인 후보만 참가 (VRFT 제외 — 0.99 고정이라 자동 최하위)
+- PSO cost ≥ 1e100 (발산) 이면 해당 후보 탈락
+- 가장 낮은 IdentRatio = Active
+
+예: PEM IdentRatio=0.12, BLA IdentRatio=0.15 → Active=PEM, Alt=BLA.
+
 ---
 
 ## 10. PEM — 폐루프 무편향 최적 식별 (주방법)
@@ -510,7 +529,17 @@ $$H = \Gamma_{p_f} \cdot \Delta_{p_p}$$
 - `Γ_{p_f} = [C; C A_K; ...; C A_K^{p_f-1}]`: `(A_K, C)` 확장 관측성
 - `Δ_{p_p} = [[B_K, K],\; [A_K B_K, A_K K],\; ...]`: `(A_K, [B_K\ K])` 확장 제어성
 
-**SVD + Gavish-Donoho** 로 차수 `n` 결정 (§9.5와 동일 공식).
+**SVD + Gavish-Donoho** 로 차수 `n` 결정 (Gavish & Donoho 2014, §17 정리표 참조).
+
+### 10.4.1 차수 상한 n ≤ 2
+
+Gavish-Donoho 가 `n=3` 이상을 제안해도 **하드 캡 `n ≤ 2`** 적용. 이유:
+
+1. FTD 비행 동특성은 대부분 **1~2차** (관성 + 감쇠). 3차 이상은 노이즈 피팅 (과적합).
+2. n=4 에서 DC 게인이 -13 또는 +9987 로 추정된 사례 확인됨 — spurious 극점이 시뮬 발산 유발.
+3. 파라미터 수: n=2 → `n² + 3n + 1 = 11`, n=4 → 29. 후자는 500샘플 데이터 대비 과잉.
+
+Gavish-Donoho 는 `n ∈ {1, 2}` 중 자동 선택. 하한 1, 상한 2. 강축 커플링 (Pitch ↔ Forward 등) 이 있는 경우 2차 SISO 로는 잔차 구조 남을 수 있으나, MIMO 확장 전까지는 이 상한이 안전-성능 최선 균형.
 
 $$\Gamma_{p_f} = U_n \cdot \Sigma_n^{1/2}, \qquad \Delta_{p_p} = \Sigma_n^{1/2} \cdot V_n^T$$
 
@@ -585,6 +614,20 @@ $$\underbrace{x(k+1) = A x(k) + B u(k)}_{\text{결정론적 (PSO 시뮬)}} + \un
 | `A_K` shift LS | `Γ_u^T Γ_u` 특이 | 예외 → fallback |
 | PEM 발산 | 불안정 궤적 | 모든 trial 실패 → 초기값 유지 |
 | PSO NaN | 식별 모델 잘못 | `cost = MaxValue` |
+
+### 10.11 DC 게인 보정 (음수 플립 + 스텝 스케일링)
+
+PSO 시뮬 전 두 가지 보정 적용 (PEM, N4SID 폴백 공통):
+
+**음수 DC 게인 플립**: 식별된 `dcGain < 0` 이면 `B, D` 부호 반전 → 양수 DC 확보. FTD 의 축별 부호 규약 (예: Roll 의 `-현재각도`) 이나 추정 오차로 DC 음수 가능. 양의 `Kp` + 음의 `G` = 양의 피드백 → 전 particle 발산. 반전으로 해소.
+
+**스텝 스케일링 (refScale)**: `dcGain` 이 매우 크거나 작으면 단위 스텝 (y→1.0) 이 비현실적:
+- `dcGain = 0.1` → `u=1` 로 달성 가능 `y_max = 0.1`. 목표 1.0 도달 불가 → 모든 PID 의 ITAE 거대.
+- `dcGain = 10` → 미세 `u` 필요. 포화 불가피.
+
+$$\text{refScale} = \min(1,\; |dcGain| \times 0.8)$$
+
+`yTarget`, 스텝 입력 `r`, 오버슈트 임계 모두 `refScale` 로 스케일. 모델의 달성 가능 범위 안에서 ITAE 비용 계산.
 
 ---
 

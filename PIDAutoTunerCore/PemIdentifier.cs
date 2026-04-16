@@ -203,88 +203,217 @@ namespace PIDAutoTuner
             double[] ud = (double[])u.Clone(); Detrend(ud);
             double[] yd = (double[])y.Clone(); Detrend(yd);
 
+            // ── Observer canonical form 시도 (n=2 전용) ──
+            // O = [C; C*A], det(O) > 1e-8 이면 축소 파라미터화 사용
+            if (n == 2)
+            {
+                // Observability matrix O = [C; C*A] (2×2)
+                var O = MB.Dense(2, 2);
+                for (int c = 0; c < 2; c++) O[0, c] = init.C[0, c];
+                for (int c = 0; c < 2; c++)
+                {
+                    double s = 0;
+                    for (int j = 0; j < 2; j++) s += init.C[0, j] * init.A[j, c];
+                    O[1, c] = s;
+                }
+                double detO = O[0, 0] * O[1, 1] - O[0, 1] * O[1, 0];
+                if (Math.Abs(detO) > 1e-8)
+                {
+                    // T = O, T^-1
+                    var Tinv = MB.Dense(2, 2);
+                    Tinv[0, 0] = O[1, 1] / detO; Tinv[0, 1] = -O[0, 1] / detO;
+                    Tinv[1, 0] = -O[1, 0] / detO; Tinv[1, 1] = O[0, 0] / detO;
+
+                    // A_can = T * A * T^-1
+                    var TA = O * init.A;
+                    var Acan = TA * Tinv;
+                    // B_can = T * B
+                    var Bcan = O * init.B;
+                    // K_can = T * K
+                    var Kcan = O * init.K;
+                    // D unchanged
+                    double Dcan = init.D;
+
+                    // Extract canonical params: A = [[0,1],[-a2,-a1]]
+                    // a1 = -A_can[1,1], a2 = -A_can[1,0]
+                    double a1 = -Acan[1, 1];
+                    double a2 = -Acan[1, 0];
+
+                    // Pack canonical θ = [a1, a2, b1, b2, d, k1, k2] (7 params)
+                    int nParamsCan = 7;
+                    double[] thetaCan = new double[nParamsCan];
+                    PackCanonical(thetaCan, a1, a2, Bcan[0, 0], Bcan[1, 0], Dcan, Kcan[0, 0], Kcan[1, 0]);
+
+                    double prevCost = ComputeCostOnlyCanonical(thetaCan, ud, yd, N);
+                    double initCost = prevCost;
+
+                    double lambda = 1e-3;
+                    const double nuUp = 10.0;
+                    const double nuDown = 10.0;
+                    const double lambdaMin = 1e-10;
+                    const double lambdaMax = 1e10;
+
+                    for (int iter = 0; iter < maxIter; iter++)
+                    {
+                        var e0 = ComputeResidualsCanonical(thetaCan, ud, yd, N);
+                        double cost0 = SumSquares(e0) / N;
+
+                        var J = MB.Dense(N, nParamsCan);
+                        for (int i = 0; i < nParamsCan; i++)
+                        {
+                            double h_i = 1e-5 * Math.Max(Math.Abs(thetaCan[i]), 1e-3);
+                            double save = thetaCan[i];
+                            thetaCan[i] = save + h_i;
+                            var eP = ComputeResidualsCanonical(thetaCan, ud, yd, N);
+                            thetaCan[i] = save - h_i;
+                            var eM = ComputeResidualsCanonical(thetaCan, ud, yd, N);
+                            thetaCan[i] = save;
+                            double inv2h = 0.5 / h_i;
+                            for (int k = 0; k < N; k++) J[k, i] = (eP[k] - eM[k]) * inv2h;
+                        }
+
+                        var JJ = J.Transpose() * J;
+                        var Je = J.Transpose() * VB.DenseOfArray(e0);
+
+                        double[] thetaNew = new double[nParamsCan];
+                        bool accepted = false;
+                        double newCost = cost0;
+                        for (int trial = 0; trial < 10; trial++)
+                        {
+                            var JJlam = JJ.Clone();
+                            for (int i = 0; i < nParamsCan; i++)
+                                JJlam[i, i] = JJ[i, i] + lambda * Math.Max(1e-10, JJ[i, i]);
+
+                            Vector<double> delta;
+                            try { delta = JJlam.Solve(-Je); }
+                            catch { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
+
+                            for (int i = 0; i < nParamsCan; i++) thetaNew[i] = thetaCan[i] + delta[i];
+
+                            if (!IsStableCanonical(thetaNew)) { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
+
+                            double costN = ComputeCostOnlyCanonical(thetaNew, ud, yd, N);
+                            if (costN < cost0 && !double.IsNaN(costN) && !double.IsInfinity(costN))
+                            {
+                                Array.Copy(thetaNew, thetaCan, nParamsCan);
+                                newCost = costN;
+                                accepted = true;
+                                lambda = Math.Max(lambda / nuDown, lambdaMin);
+                                break;
+                            }
+                            lambda = Math.Min(lambda * nuUp, lambdaMax);
+                        }
+                        if (!accepted) break;
+
+                        if (Math.Abs(prevCost - newCost) < tol * Math.Max(1.0, prevCost)) { prevCost = newCost; break; }
+                        prevCost = newCost;
+                    }
+
+                    // Convert canonical back to full (A,B,C,D,K)
+                    UnpackCanonical(thetaCan, out double fa1, out double fa2,
+                        out double fb1, out double fb2, out double fd, out double fk1, out double fk2);
+                    var result = new Model { Order = n };
+                    result.A = MB.Dense(2, 2);
+                    result.A[0, 0] = 0; result.A[0, 1] = 1;
+                    result.A[1, 0] = -fa2; result.A[1, 1] = -fa1;
+                    result.B = MB.Dense(2, 1);
+                    result.B[0, 0] = fb1; result.B[1, 0] = fb2;
+                    result.C = MB.Dense(1, 2);
+                    result.C[0, 0] = 1; result.C[0, 1] = 0;
+                    result.D = fd;
+                    result.K = MB.Dense(2, 1);
+                    result.K[0, 0] = fk1; result.K[1, 0] = fk2;
+                    result.InnovationRms = Math.Sqrt(Math.Max(0, prevCost));
+                    result.Info = $"PEM-can n={n} D={fd:0.000} cost={prevCost:0.4e} (init {initCost:0.4e})";
+                    return result;
+                }
+            }
+
+            // ── Full parameterization (fallback or n != 2) ──
             // 파라미터 패킹: vec(A); vec(B); vec(C); D; vec(K)
             int nParams = n * n + 3 * n + 1;
             double[] theta = new double[nParams];
             PackTheta(init, theta, n);
 
-            double prevCost = ComputeCostOnly(theta, n, ud, yd, N);
-            double initCost = prevCost;
-
-            // LM λ 는 iter 간 지속. 성공 시 감소(GN 방향 신뢰도 ↑), 실패 시 증가(경사하강 ↑).
-            // 표준 Marquardt adaptation: 성공 /= νDown, 실패 *= νUp.
-            double lambda = 1e-3;
-            const double nuUp = 10.0;
-            const double nuDown = 10.0;
-            const double lambdaMin = 1e-10;
-            const double lambdaMax = 1e10;
-
-            for (int iter = 0; iter < maxIter; iter++)
             {
-                var e0 = ComputeResiduals(theta, n, ud, yd, N);
-                double cost0 = SumSquares(e0) / N;
+                double prevCost = ComputeCostOnly(theta, n, ud, yd, N);
+                double initCost = prevCost;
 
-                // FD Jacobian: 파라미터별 상대 스케일 적용
-                //   h_i = 1e-5 · max(|θ_i|, 1e-3)
-                // vec(A) (~O(1)) 와 D (~O(0.01)) 의 스케일 차이 보정
-                var J = MB.Dense(N, nParams);
-                for (int i = 0; i < nParams; i++)
+                // LM λ 는 iter 간 지속. 성공 시 감소(GN 방향 신뢰도 ↑), 실패 시 증가(경사하강 ↑).
+                // 표준 Marquardt adaptation: 성공 /= νDown, 실패 *= νUp.
+                double lambda = 1e-3;
+                const double nuUp = 10.0;
+                const double nuDown = 10.0;
+                const double lambdaMin = 1e-10;
+                const double lambdaMax = 1e10;
+
+                for (int iter = 0; iter < maxIter; iter++)
                 {
-                    double h_i = 1e-5 * Math.Max(Math.Abs(theta[i]), 1e-3);
-                    double save = theta[i];
-                    theta[i] = save + h_i;
-                    var eP = ComputeResiduals(theta, n, ud, yd, N);
-                    theta[i] = save - h_i;
-                    var eM = ComputeResiduals(theta, n, ud, yd, N);
-                    theta[i] = save;
-                    double inv2h = 0.5 / h_i;
-                    for (int k = 0; k < N; k++) J[k, i] = (eP[k] - eM[k]) * inv2h;
-                }
+                    var e0 = ComputeResiduals(theta, n, ud, yd, N);
+                    double cost0 = SumSquares(e0) / N;
 
-                // LM 정규방정식: (J^T J + λ·diag(J^T J)) Δθ = -J^T e
-                var JJ = J.Transpose() * J;
-                var Je = J.Transpose() * VB.DenseOfArray(e0);
-
-                double[] thetaNew = new double[nParams];
-                bool accepted = false;
-                double newCost = cost0;
-                for (int trial = 0; trial < 10; trial++)
-                {
-                    var JJlam = JJ.Clone();
+                    // FD Jacobian: 파라미터별 상대 스케일 적용
+                    //   h_i = 1e-5 · max(|θ_i|, 1e-3)
+                    // vec(A) (~O(1)) 와 D (~O(0.01)) 의 스케일 차이 보정
+                    var J = MB.Dense(N, nParams);
                     for (int i = 0; i < nParams; i++)
-                        JJlam[i, i] = JJ[i, i] + lambda * Math.Max(1e-10, JJ[i, i]);
-
-                    Vector<double> delta;
-                    try { delta = JJlam.Solve(-Je); }
-                    catch { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
-
-                    for (int i = 0; i < nParams; i++) thetaNew[i] = theta[i] + delta[i];
-
-                    if (!IsStable(thetaNew, n)) { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
-
-                    double costN = ComputeCostOnly(thetaNew, n, ud, yd, N);
-                    if (costN < cost0 && !double.IsNaN(costN) && !double.IsInfinity(costN))
                     {
-                        Array.Copy(thetaNew, theta, nParams);
-                        newCost = costN;
-                        accepted = true;
-                        // 성공 → λ 감소 (다음 iter 에서 GN 방향 더 신뢰)
-                        lambda = Math.Max(lambda / nuDown, lambdaMin);
-                        break;
+                        double h_i = 1e-5 * Math.Max(Math.Abs(theta[i]), 1e-3);
+                        double save = theta[i];
+                        theta[i] = save + h_i;
+                        var eP = ComputeResiduals(theta, n, ud, yd, N);
+                        theta[i] = save - h_i;
+                        var eM = ComputeResiduals(theta, n, ud, yd, N);
+                        theta[i] = save;
+                        double inv2h = 0.5 / h_i;
+                        for (int k = 0; k < N; k++) J[k, i] = (eP[k] - eM[k]) * inv2h;
                     }
-                    lambda = Math.Min(lambda * nuUp, lambdaMax);
+
+                    // LM 정규방정식: (J^T J + λ·diag(J^T J)) Δθ = -J^T e
+                    var JJ = J.Transpose() * J;
+                    var Je = J.Transpose() * VB.DenseOfArray(e0);
+
+                    double[] thetaNew = new double[nParams];
+                    bool accepted = false;
+                    double newCost = cost0;
+                    for (int trial = 0; trial < 10; trial++)
+                    {
+                        var JJlam = JJ.Clone();
+                        for (int i = 0; i < nParams; i++)
+                            JJlam[i, i] = JJ[i, i] + lambda * Math.Max(1e-10, JJ[i, i]);
+
+                        Vector<double> delta;
+                        try { delta = JJlam.Solve(-Je); }
+                        catch { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
+
+                        for (int i = 0; i < nParams; i++) thetaNew[i] = theta[i] + delta[i];
+
+                        if (!IsStable(thetaNew, n)) { lambda = Math.Min(lambda * nuUp, lambdaMax); continue; }
+
+                        double costN = ComputeCostOnly(thetaNew, n, ud, yd, N);
+                        if (costN < cost0 && !double.IsNaN(costN) && !double.IsInfinity(costN))
+                        {
+                            Array.Copy(thetaNew, theta, nParams);
+                            newCost = costN;
+                            accepted = true;
+                            // 성공 → λ 감소 (다음 iter 에서 GN 방향 더 신뢰)
+                            lambda = Math.Max(lambda / nuDown, lambdaMin);
+                            break;
+                        }
+                        lambda = Math.Min(lambda * nuUp, lambdaMax);
+                    }
+                    if (!accepted) break;
+
+                    if (Math.Abs(prevCost - newCost) < tol * Math.Max(1.0, prevCost)) { prevCost = newCost; break; }
+                    prevCost = newCost;
                 }
-                if (!accepted) break;
 
-                if (Math.Abs(prevCost - newCost) < tol * Math.Max(1.0, prevCost)) { prevCost = newCost; break; }
-                prevCost = newCost;
+                var result = new Model { Order = n };
+                UnpackTheta(theta, result, n);
+                result.InnovationRms = Math.Sqrt(Math.Max(0, prevCost));
+                result.Info = $"PEM n={n} D={result.D:0.000} cost={prevCost:0.4e} (init {initCost:0.4e})";
+                return result;
             }
-
-            var result = new Model { Order = n };
-            UnpackTheta(theta, result, n);
-            result.InnovationRms = Math.Sqrt(Math.Max(0, prevCost));
-            result.Info = $"PEM n={n} D={result.D:0.000} cost={prevCost:0.4e} (init {initCost:0.4e})";
-            return result;
         }
 
         // ============================================================
@@ -398,6 +527,105 @@ namespace PIDAutoTuner
             for (int c = 0; c < n; c++) C[0, c] = theta[idx++];
             D = theta[idx++];
             for (int r = 0; r < n; r++) K[r, 0] = theta[idx++];
+        }
+
+        // ============================================================
+        // Observer Canonical Form helpers (n=2 전용)
+        // θ = [a1, a2, b1, b2, d, k1, k2]
+        // A = [[0,1],[-a2,-a1]], C = [1,0], B = [b1;b2], K = [k1;k2], D = d
+        // ============================================================
+
+        private static void PackCanonical(double[] theta, double a1, double a2,
+            double b1, double b2, double d, double k1, double k2)
+        {
+            theta[0] = a1; theta[1] = a2;
+            theta[2] = b1; theta[3] = b2;
+            theta[4] = d;
+            theta[5] = k1; theta[6] = k2;
+        }
+
+        private static void UnpackCanonical(double[] theta,
+            out double a1, out double a2, out double b1, out double b2,
+            out double d, out double k1, out double k2)
+        {
+            a1 = theta[0]; a2 = theta[1];
+            b1 = theta[2]; b2 = theta[3];
+            d = theta[4];
+            k1 = theta[5]; k2 = theta[6];
+        }
+
+        private static void UnpackCanonicalMatrices(double[] theta,
+            out Matrix<double> A, out Matrix<double> B, out Matrix<double> C,
+            out double D, out Matrix<double> K)
+        {
+            UnpackCanonical(theta, out double a1, out double a2,
+                out double b1, out double b2, out double d, out double k1, out double k2);
+            A = MB.Dense(2, 2);
+            A[0, 0] = 0; A[0, 1] = 1;
+            A[1, 0] = -a2; A[1, 1] = -a1;
+            B = MB.Dense(2, 1);
+            B[0, 0] = b1; B[1, 0] = b2;
+            C = MB.Dense(1, 2);
+            C[0, 0] = 1; C[0, 1] = 0;
+            D = d;
+            K = MB.Dense(2, 1);
+            K[0, 0] = k1; K[1, 0] = k2;
+        }
+
+        private static double[] ComputeResidualsCanonical(double[] theta, double[] u, double[] y, int N)
+        {
+            UnpackCanonicalMatrices(theta, out var A, out var B, out var C, out double D, out var K);
+
+            // A_K = A - K·C
+            var AK = A.Clone();
+            for (int r = 0; r < 2; r++)
+                for (int c = 0; c < 2; c++)
+                    AK[r, c] -= K[r, 0] * C[0, c];
+            var BK = MB.Dense(2, 1);
+            for (int r = 0; r < 2; r++) BK[r, 0] = B[r, 0] - K[r, 0] * D;
+
+            double[] xhat = new double[2];
+            double[] xnext = new double[2];
+            double[] e = new double[N];
+
+            for (int k = 0; k < N; k++)
+            {
+                double yhat = D * u[k];
+                for (int i = 0; i < 2; i++) yhat += C[0, i] * xhat[i];
+                e[k] = y[k] - yhat;
+
+                for (int r = 0; r < 2; r++)
+                {
+                    double s = BK[r, 0] * u[k] + K[r, 0] * y[k];
+                    for (int c = 0; c < 2; c++) s += AK[r, c] * xhat[c];
+                    xnext[r] = s;
+                }
+                var tmp = xhat; xhat = xnext; xnext = tmp;
+            }
+            return e;
+        }
+
+        private static double ComputeCostOnlyCanonical(double[] theta, double[] u, double[] y, int N)
+        {
+            var e = ComputeResidualsCanonical(theta, u, y, N);
+            return SumSquares(e) / N;
+        }
+
+        private static bool IsStableCanonical(double[] theta)
+        {
+            UnpackCanonicalMatrices(theta, out var A, out _, out var C, out _, out var K);
+            var AK = A.Clone();
+            for (int r = 0; r < 2; r++)
+                for (int c = 0; c < 2; c++)
+                    AK[r, c] -= K[r, 0] * C[0, c];
+            try
+            {
+                var eig = AK.Evd();
+                for (int i = 0; i < 2; i++)
+                    if (eig.EigenValues[i].Magnitude >= 1.0 - 1e-8) return false;
+                return true;
+            }
+            catch { return false; }
         }
 
         // ============================================================

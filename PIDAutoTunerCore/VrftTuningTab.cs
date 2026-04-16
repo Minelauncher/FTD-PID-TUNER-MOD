@@ -183,6 +183,7 @@ namespace PIDAutoTuner
             Computing,  // 수집 끝, VRFT 계산 중
             Done,       // 계산 완료 (결과 있음)
             Failed,     // 실패 (에러 메시지 있음)
+            Validating, // 검증 모드: 전 축 y 수집 중 (5초)
         }
 
         /// <summary>축 타입 — 사용자가 각 tab 에서 지정. 피치 고도유지 로직 등에 사용.</summary>
@@ -292,6 +293,10 @@ namespace PIDAutoTuner
 
             public string LastMessage = "";
 
+            // ── Validation (검증) ──
+            public double ValidateStartT;                      // 검증 시작 시간
+            public readonly List<List<double>> ValidateY = new List<List<double>>(); // 축별 y 기록
+
             public void Clear()
             {
                 Recording = false;
@@ -323,6 +328,8 @@ namespace PIDAutoTuner
                 AltKp = AltTi = AltTd = 0;
                 AltMethodName = AltMethodInfo = "";
                 LastMessage = "";
+                ValidateStartT = 0;
+                ValidateY.Clear();
             }
         }
 
@@ -439,6 +446,15 @@ namespace PIDAutoTuner
                         _autoState = AutoTuneState.Failed;
                         _sess.LastMessage = "Auto-tune failed / 자동 튜닝 실패: " + e.Message;
                     }
+                    return;
+                }
+
+                // 검증 모드 틱 처리 (가진 없이 전 축 y 수집)
+                if (_autoState == AutoTuneState.Validating)
+                {
+                    double dtVal = Time.fixedDeltaTime;
+                    if (dtVal <= 0) dtVal = 0.02;
+                    OnValidateTick(dtVal);
                     return;
                 }
 
@@ -653,7 +669,9 @@ namespace PIDAutoTuner
                 M.m<VariableControllerMaster>(_ =>
                 {
                     string rec;
-                    if (_autoState == AutoTuneState.Computing)
+                    if (_autoState == AutoTuneState.Validating)
+                        rec = "Validating / 검증 중";
+                    else if (_autoState == AutoTuneState.Computing)
                         rec = "Computing / 계산 중";
                     else if (_sess.Recording)
                         rec = "Recording / 녹화중";
@@ -775,7 +793,7 @@ namespace PIDAutoTuner
                 "fixaxes"
             ));
 
-            ScreenSegmentTable excTable = base.CreateTableSegment(1, 3);
+            ScreenSegmentTable excTable = base.CreateTableSegment(1, 5);
             excTable.SqueezeTable = false;
 
             excTable.AddInterpretter(MakeSliderFloat(
@@ -784,6 +802,22 @@ namespace PIDAutoTuner
                 () => _s.ExciteAmp,
                 f => _s.ExciteAmp = Clamp(f, 0f, 10f),
                 0f, 10f, 0.05f, "0.00", "A"
+            ));
+
+            excTable.AddInterpretter(MakeSliderFloat(
+                "Freq base Hz / 기저 주파수",
+                "Base frequency for Sine/MultiSine excitation.\n---\nSine/MultiSine 가진의 기저 주파수.",
+                () => _s.ExciteFreqHz,
+                f => _s.ExciteFreqHz = Clamp(f, 0.01f, 5.0f),
+                0.01f, 5.0f, 0.01f, "0.00", "fBase"
+            ));
+
+            excTable.AddInterpretter(MakeSliderFloat(
+                "Freq max Hz / 최대 주파수",
+                "End frequency for Chirp excitation.\n---\nChirp 가진의 최대 주파수.",
+                () => _s.ChirpEndHz,
+                f => _s.ChirpEndHz = Clamp(f, 0.1f, 10.0f),
+                0.1f, 10.0f, 0.1f, "0.0", "fMax"
             ));
         }
 
@@ -845,6 +879,15 @@ namespace PIDAutoTuner
                 "Swap method / 방법 전환",
                 "Swap active result with alternative (PEM ↔ VRFT).\nAuto-selected based on PEM innovation RMS; override here.\n---\n주 결과와 대안 결과를 교체 (PEM ↔ VRFT).\n자동 선택을 수동으로 뒤집을 때 사용.",
                 _ => SwapPidMethod()
+            ));
+
+            seg.AddInterpretter(MakeButton(
+                "Validate / 검증",
+                "Health check: record y on all registered axes for 5 seconds (no excitation),\n" +
+                "compute std(y) per axis, flag any with yStd > 2× median as HIGH.\n---\n" +
+                "검증: 전 축 y를 5초간 수집 (가진 없음), 축별 std(y) 계산,\n" +
+                "중앙값의 2배 초과 시 HIGH 경고.",
+                _ => ValidateAxes()
             ));
         }
 
@@ -1539,6 +1582,106 @@ namespace PIDAutoTuner
             _sess.AltKp = k; _sess.AltTi = i; _sess.AltTd = d;
             _sess.AltMethodName = n; _sess.AltMethodInfo = info;
             _sess.LastMessage = $"Swapped → {_sess.ActiveMethodName}: Kp={_sess.Kp:0.000} Ti={_sess.Ti:0.1} Td={_sess.Td:0.00}";
+        }
+
+        private void ValidateAxes()
+        {
+            if (_autoState == AutoTuneState.Validating)
+            {
+                _sess.LastMessage = "Validation already in progress / 검증 이미 진행 중";
+                return;
+            }
+
+            // Ensure axis discovery
+            DiscoverSiblingAxes();
+
+            if (_tabsByAxis.Count < 2)
+            {
+                _sess.LastMessage = "Need >= 2 registered axes for validation. Open each axis PID UI first. / 검증에 2개 이상 축 필요. 각 축 PID UI를 먼저 열어주세요.";
+                return;
+            }
+
+            // Initialize validation buffers — one list per registered axis
+            _sess.ValidateY.Clear();
+            foreach (var _ in _tabsByAxis) _sess.ValidateY.Add(new List<double>());
+            _sess.ValidateStartT = 0;
+            _autoState = AutoTuneState.Validating;
+            _sess.LastMessage = "Validating: collecting y on all axes for 5s... / 검증: 전 축 y 수집 중 (5초)...";
+        }
+
+        private void OnValidateTick(double dt)
+        {
+            if (_autoState != AutoTuneState.Validating) return;
+
+            _sess.ValidateStartT += dt;
+
+            // Collect y from each registered axis
+            int idx = 0;
+            foreach (var kv in _tabsByAxis)
+            {
+                if (idx >= _sess.ValidateY.Count) break;
+                var ctrl = kv.Key.GetCurrentController();
+                double yVal = ctrl != null ? ctrl.LastProcessVariable : 0;
+                _sess.ValidateY[idx].Add(yVal);
+                idx++;
+            }
+
+            // After 5 seconds, compute stats
+            if (_sess.ValidateStartT >= 5.0)
+            {
+                var stdValues = new List<double>();
+                var axisNames = new List<string>();
+
+                idx = 0;
+                foreach (var kv in _tabsByAxis)
+                {
+                    string axisLabel;
+                    if (kv.Value != null && kv.Value._s != null)
+                        axisLabel = kv.Value._s.AxisKind.ToString();
+                    else
+                        axisLabel = $"Axis {idx + 1}";
+
+                    if (idx < _sess.ValidateY.Count && _sess.ValidateY[idx].Count > 1)
+                    {
+                        var ys = _sess.ValidateY[idx];
+                        double mean = 0;
+                        for (int i = 0; i < ys.Count; i++) mean += ys[i];
+                        mean /= ys.Count;
+                        double variance = 0;
+                        for (int i = 0; i < ys.Count; i++) variance += (ys[i] - mean) * (ys[i] - mean);
+                        variance /= (ys.Count - 1);
+                        double std = Math.Sqrt(variance);
+                        stdValues.Add(std);
+                        axisNames.Add(axisLabel);
+                    }
+                    else
+                    {
+                        stdValues.Add(0);
+                        axisNames.Add(axisLabel);
+                    }
+                    idx++;
+                }
+
+                // Compute median
+                double median = 0;
+                if (stdValues.Count > 0)
+                {
+                    var sorted = new List<double>(stdValues);
+                    sorted.Sort();
+                    median = sorted[sorted.Count / 2];
+                }
+
+                // Build result message
+                var parts = new List<string>();
+                for (int i = 0; i < stdValues.Count; i++)
+                {
+                    string flag = (median > 1e-9 && stdValues[i] > 2.0 * median) ? " (HIGH)" : "";
+                    parts.Add($"{axisNames[i]}: yStd={stdValues[i]:0.000}{flag}");
+                }
+
+                _autoState = AutoTuneState.Done;
+                _sess.LastMessage = "Validate: " + string.Join(", ", parts);
+            }
         }
 
         private void CaptureSetPointAdjustBase()

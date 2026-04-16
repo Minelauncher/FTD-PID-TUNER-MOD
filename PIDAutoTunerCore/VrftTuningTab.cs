@@ -351,12 +351,12 @@ namespace PIDAutoTuner
         }
 
         // ── 축 분리 모드 (Axis Fixture) ──
-        // 사용자가 여러 축의 PID UI 를 열면 각 tab 이 자기 축을 _tabsByAxis 에 등록.
-        // 튜닝 시작 시 이 registry 에서 *다른* 축의 SP 를 현재 값으로 freeze,
-        // Recording 중 매 틱 재적용 → 자세/고도 유지 (기존 PID 가 0 SP 따라감).
-        // 사용자가 튜닝 전에 각 축 UI 한 번씩 열어놓아야 함.
+        // 방법 1: 리플렉션으로 _focus 의 부모 객체에서 형제 VariableControllerMaster 자동 발견.
+        // 방법 2: 사용자가 각 축 PID UI 열면 자동 등록 (_tabsByAxis).
+        // 두 방법 병합 — 리플렉션 성공하면 자동, 실패하면 수동 등록 폴백.
         private static readonly Dictionary<VariableControllerMaster, VrftTuningTab> _tabsByAxis
             = new Dictionary<VariableControllerMaster, VrftTuningTab>();
+        private static bool _axisDiscoveryAttempted = false;
         private readonly Dictionary<VariableControllerMaster, float> _frozenOtherSPs
             = new Dictionary<VariableControllerMaster, float>();
 
@@ -1146,6 +1146,9 @@ namespace PIDAutoTuner
 
             if (!_s.FixOtherAxes) return;
 
+            // 리플렉션으로 형제 축 자동 발견 시도 (1회만)
+            DiscoverSiblingAxes();
+
             // 등록된 축 중에서 Hover / Pitch 식별 (AxisKind 로)
             foreach (var kv in _tabsByAxis)
             {
@@ -1234,6 +1237,181 @@ namespace PIDAutoTuner
             _altHoldActive = false;
             _altitudeSourceAxis = null;
             _pitchTargetAxis = null;
+        }
+
+        // ============================================================
+        // 축 자동 발견 (리플렉션) — _focus 의 부모에서 형제 VCM 열거
+        // ============================================================
+
+        /// <summary>
+        /// _focus 로부터 부모 객체를 리플렉션으로 탐색, 형제 VariableControllerMaster 발견.
+        /// 성공하면 _tabsByAxis 에 자동 등록 (tab=null — SP 접근만 가능, UI 설정 없음).
+        /// 실패하면 기존 수동 등록 방식으로 폴백.
+        /// </summary>
+        private void DiscoverSiblingAxes()
+        {
+            if (_axisDiscoveryAttempted) return;
+            _axisDiscoveryAttempted = true;
+            if (_focus == null) return;
+
+            try
+            {
+                var siblings = FindSiblingControllers(_focus);
+                int added = 0;
+                foreach (var vcm in siblings)
+                {
+                    if (vcm == null || vcm == _focus) continue;
+                    if (!_tabsByAxis.ContainsKey(vcm))
+                    {
+                        _tabsByAxis[vcm] = null;  // tab 없음 (자동발견), SP 접근만 가능
+                        added++;
+                    }
+                }
+                if (added > 0)
+                    _sess.LastMessage = $"Auto-discovered {added} sibling axes / {added}개 형제 축 자동 발견";
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// VCM 의 부모 체인을 리플렉션으로 탐색하여 형제 VCM 목록 반환.
+        /// 전략: (1) 필드에서 부모 찾기 (2) 부모의 필드/프로퍼티에서 VCM 컬렉션 찾기.
+        /// </summary>
+        private static List<VariableControllerMaster> FindSiblingControllers(VariableControllerMaster focus)
+        {
+            var result = new List<VariableControllerMaster>();
+            Type vcmType = focus.GetType();
+            var allFields = new List<System.Reflection.FieldInfo>();
+            var allProps = new List<System.Reflection.PropertyInfo>();
+            const System.Reflection.BindingFlags bf =
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Public;
+
+            // ── 전략 1: focus 자신의 필드에서 부모 객체 탐색 ──
+            for (Type t = vcmType; t != null && t != typeof(object); t = t.BaseType)
+            {
+                allFields.AddRange(t.GetFields(bf | System.Reflection.BindingFlags.DeclaredOnly));
+                allProps.AddRange(t.GetProperties(bf | System.Reflection.BindingFlags.DeclaredOnly));
+            }
+
+            // 부모 후보: 필드/프로퍼티 중 VCM 이 아니고, null 아닌 참조 타입
+            foreach (var field in allFields)
+            {
+                if (field.FieldType.IsValueType) continue;
+                if (field.FieldType == typeof(string)) continue;
+                if (typeof(VariableControllerMaster).IsAssignableFrom(field.FieldType)) continue;
+
+                object parent = null;
+                try { parent = field.GetValue(focus); } catch { continue; }
+                if (parent == null) continue;
+
+                // ── 전략 2: 부모에서 VCM 컬렉션 탐색 ──
+                var found = ExtractVcmsFromObject(parent);
+                if (found.Count >= 2) // 최소 2개 (self + 형제)
+                {
+                    result.AddRange(found);
+                    return result; // 첫 성공한 경로 사용
+                }
+            }
+
+            // 프로퍼티도 시도
+            foreach (var prop in allProps)
+            {
+                if (!prop.CanRead) continue;
+                if (prop.PropertyType.IsValueType || prop.PropertyType == typeof(string)) continue;
+
+                object parent = null;
+                try { parent = prop.GetValue(focus); } catch { continue; }
+                if (parent == null) continue;
+
+                var found = ExtractVcmsFromObject(parent);
+                if (found.Count >= 2)
+                {
+                    result.AddRange(found);
+                    return result;
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>객체의 필드/프로퍼티에서 VCM 인스턴스를 모두 추출.</summary>
+        private static List<VariableControllerMaster> ExtractVcmsFromObject(object obj)
+        {
+            var result = new List<VariableControllerMaster>();
+            if (obj == null) return result;
+            Type objType = obj.GetType();
+            const System.Reflection.BindingFlags bf =
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Public;
+
+            // 직접 VCM 필드
+            foreach (var f in objType.GetFields(bf))
+            {
+                try
+                {
+                    if (typeof(VariableControllerMaster).IsAssignableFrom(f.FieldType))
+                    {
+                        var vcm = f.GetValue(obj) as VariableControllerMaster;
+                        if (vcm != null) result.Add(vcm);
+                    }
+                    // VCM 배열
+                    else if (f.FieldType.IsArray &&
+                             typeof(VariableControllerMaster).IsAssignableFrom(f.FieldType.GetElementType()))
+                    {
+                        var arr = f.GetValue(obj) as Array;
+                        if (arr != null)
+                            foreach (var item in arr)
+                            {
+                                var vcm = item as VariableControllerMaster;
+                                if (vcm != null) result.Add(vcm);
+                            }
+                    }
+                    // IEnumerable<VCM> (List, etc.)
+                    else if (typeof(System.Collections.IEnumerable).IsAssignableFrom(f.FieldType)
+                             && !f.FieldType.IsValueType && f.FieldType != typeof(string))
+                    {
+                        var enumerable = f.GetValue(obj) as System.Collections.IEnumerable;
+                        if (enumerable != null)
+                            foreach (var item in enumerable)
+                            {
+                                var vcm = item as VariableControllerMaster;
+                                if (vcm != null) result.Add(vcm);
+                            }
+                    }
+                }
+                catch { }
+            }
+
+            // 프로퍼티도
+            foreach (var p in objType.GetProperties(bf))
+            {
+                if (!p.CanRead) continue;
+                try
+                {
+                    if (typeof(VariableControllerMaster).IsAssignableFrom(p.PropertyType))
+                    {
+                        var vcm = p.GetValue(obj) as VariableControllerMaster;
+                        if (vcm != null) result.Add(vcm);
+                    }
+                    else if (typeof(System.Collections.IEnumerable).IsAssignableFrom(p.PropertyType)
+                             && !p.PropertyType.IsValueType && p.PropertyType != typeof(string))
+                    {
+                        var enumerable = p.GetValue(obj) as System.Collections.IEnumerable;
+                        if (enumerable != null)
+                            foreach (var item in enumerable)
+                            {
+                                var vcm = item as VariableControllerMaster;
+                                if (vcm != null) result.Add(vcm);
+                            }
+                    }
+                }
+                catch { }
+            }
+
+            return result;
         }
 
         // ============================================================

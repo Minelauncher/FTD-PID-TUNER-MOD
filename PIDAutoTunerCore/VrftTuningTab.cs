@@ -2169,9 +2169,20 @@ namespace PIDAutoTuner
             catch { dcGain = double.NaN; }
 
             // ── 10. PID 시뮬레이션 + PSO 탐색 ──
-            // 상태공간 모델: x(k+1) = A x(k) + B u(k),  y(k) = C x(k) + D u(k)
-            // 실시간 제어기는 샘플 지연 존재 → 1-샘플 지연 측정으로 algebraic loop 해결:
-            //   u(k)는 y(k-1) 기준으로 계산 → D 항이 자연스럽게 반영됨.
+            // ── DC 게인 보정 ──
+            // (1) 음수 DC → 양의 피드백 = PSO 전 particle 발산. B, D 부호 반전으로 해결.
+            // (2) |DC| 가 매우 크거나 작으면 step to 1.0 이 비현실적.
+            //     yTarget 를 |DC| 기준으로 스케일 → 달성 가능 범위 내에서 ITAE 평가.
+            if (dcGain < -1e-6)
+            {
+                for (int k = 0; k < order; k++) B_mat[k, 0] = -B_mat[k, 0];
+                D_sc = -D_sc;
+                dcGain = -dcGain;
+            }
+            double refScale = (!double.IsNaN(dcGain) && dcGain > 1e-3)
+                ? Math.Min(1.0, Math.Abs(dcGain) * 0.8)
+                : 1.0;
+
             int simLen = Math.Min(800, Math.Max(200, (int)(6.0 * dominantTau / dt)));
             double targetTs = Math.Max(0.5, 2.0 * dominantTau);
             double tauM = 0.2 * targetTs;
@@ -2180,10 +2191,9 @@ namespace PIDAutoTuner
             for (int k = 0; k < simLen; k++)
             {
                 double tm = k * dt / tauM;
-                yTarget[k] = 1.0 - (1.0 + tm) * Math.Exp(-tm);
+                yTarget[k] = refScale * (1.0 - (1.0 + tm) * Math.Exp(-tm));
             }
 
-            // 상태공간 → 단순 배열 캐시 (PSO 루프에서 반복 평가)
             double[,] Ac = new double[order, order];
             double[] Bc = new double[order];
             double[] Cc = new double[order];
@@ -2207,7 +2217,7 @@ namespace PIDAutoTuner
 
                 for (int k = 0; k < simLen; k++)
                 {
-                    double r = 1.0;
+                    double r = refScale;
                     double e = r - yMeas;
                     integ += e * dt;
                     double deriv = (k > 0) ? (e - prevE) / dt : 0;
@@ -2239,7 +2249,7 @@ namespace PIDAutoTuner
 
                     yMeas = yk; // 다음 스텝에서 제어기가 참조
                 }
-                cost += 10.0 * Math.Max(0, maxY - 1.0);    // 오버슈트 페널티
+                cost += 10.0 * Math.Max(0, maxY - refScale);    // 오버슈트 페널티
                 return cost;
             };
 
@@ -2368,8 +2378,18 @@ namespace PIDAutoTuner
             }
             catch { dcGain = double.NaN; }
 
+            // ── DC 게인 보정 (음수 플립 + 스텝 스케일링) ──
+            if (dcGain < -1e-6)
+            {
+                for (int k = 0; k < n; k++) B[k, 0] = -B[k, 0];
+                D_sc = -D_sc;
+                dcGain = -dcGain;
+            }
+            double refScale = (!double.IsNaN(dcGain) && dcGain > 1e-3)
+                ? Math.Min(1.0, Math.Abs(dcGain) * 0.8)
+                : 1.0;
+
             // ── 4. PSO + 폐루프 시뮬 (1-샘플 지연 측정) ──
-            // 결정론적 모델 (A,B,C,D) 사용; Kalman gain K는 노이즈용이므로 시뮬에서 제외
             int simLen = Math.Min(800, Math.Max(200, (int)(6.0 * dominantTau / dt)));
             double targetTs = Math.Max(0.5, 2.0 * dominantTau);
             double tauM = 0.2 * targetTs;
@@ -2378,7 +2398,7 @@ namespace PIDAutoTuner
             for (int k = 0; k < simLen; k++)
             {
                 double tm = k * dt / tauM;
-                yTarget[k] = 1.0 - (1.0 + tm) * Math.Exp(-tm);
+                yTarget[k] = refScale * (1.0 - (1.0 + tm) * Math.Exp(-tm));
             }
 
             double[,] Ac = new double[n, n];
@@ -2400,7 +2420,7 @@ namespace PIDAutoTuner
 
                 for (int k = 0; k < simLen; k++)
                 {
-                    double r = 1.0;
+                    double r = refScale;
                     double e = r - yMeas;
                     integ += e * dt;
                     double deriv = (k > 0) ? (e - prevE) / dt : 0;
@@ -2429,7 +2449,7 @@ namespace PIDAutoTuner
                     if (yk > maxY) maxY = yk;
                     yMeas = yk;
                 }
-                cost += 10.0 * Math.Max(0, maxY - 1.0);
+                cost += 10.0 * Math.Max(0, maxY - refScale);
                 return cost;
             };
 

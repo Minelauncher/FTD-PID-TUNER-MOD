@@ -1389,6 +1389,23 @@ namespace PIDAutoTuner
                 return;
             }
 
+            // Step prelude (첫 0.5초) 를 식별 데이터에서 제외.
+            // Step 은 DC 정보 주입용이지만 PBSID VAR 회귀의 정상성 가정 위반 → transient 오염.
+            // 블록 시작이 녹화 시작(step 구간)과 겹치면 잘라냄. 이후 블록이면 무관.
+            int stepSkip = 0;
+            if (blkStart == 0)
+            {
+                stepSkip = Math.Min((int)(0.5 / dt) + 1, blkLen / 4); // 최대 블록의 1/4까지만
+                blkStart += stepSkip;
+                blkLen -= stepSkip;
+            }
+            if (blkLen < 64)
+            {
+                _autoState = AutoTuneState.Failed;
+                _sess.LastMessage = $"Auto-tune failed: block too short after step skip / 스텝 제외 후 블록 부족";
+                return;
+            }
+
             double[] u = new double[blkLen];
             double[] y = new double[blkLen];
             _sess.U.CopyTo(blkStart, u, 0, blkLen);
@@ -2347,24 +2364,27 @@ namespace PIDAutoTuner
             if (stdU < 1e-5) throw new Exception($"Excitation too weak (std(u)={stdU:0.0e})");
             if (stdY < 1e-5) throw new Exception($"Response too weak (std(y)={stdY:0.0e})");
 
-            // ── 1. PBSID-opt 초기 식별 (n=3 조건부 허용) ──
-            // 이전: orderCap=2 하드캡 (n=4에서 dcGain=-13 등 overfitting).
-            // 개선: n=3까지 허용, sanity check 실패 시 n=2 폴백.
-            // Hover는 실질 3차(추력기 + 관성적분 + 감쇠), n=2 강제 시 정보 손실.
+            // ── 1. PBSID-opt 초기 식별 ──
+            // n=2 항상 실행 + n=3 조건부 시도 → innovation cost 비교 → 더 나은 쪽 선택.
+            // 이전: n=3 먼저 시도 → sanity만 보고 선택 → PSO에서 경계값(Kp=0.001) 발생.
+            // 개선: 둘 다 돌리고 실제 cost로 비교.
             int pastP = Math.Min(30, N / 8);
-            PemIdentifier.Model refined = null;
 
-            // n=3 시도 (Gavish-Donoho가 n≥3 제안할 때만 실제로 n=3 사용)
+            // n=2 (항상)
+            var init2 = PemIdentifier.IdentifyPbsid(u, y, pastP, orderCap: 2);
+            var refined = PemIdentifier.RefinePem(init2, u, y, maxIter: 15, tol: 1e-6);
+
+            // n=3 시도 → sanity check + cost 비교
             try
             {
                 var init3 = PemIdentifier.IdentifyPbsid(u, y, pastP, orderCap: 3);
-                var ref3 = PemIdentifier.RefinePem(init3, u, y, maxIter: 15, tol: 1e-6);
-
-                // Sanity check: |dcGain| ∈ [0.01, 100], 안정 (max|eig(A)| < 0.99)
-                bool sane = true;
-                int n3 = ref3.Order;
-                if (n3 >= 3)
+                if (init3.Order >= 3)  // Gavish-Donoho가 실제로 n≥3 제안한 경우만
                 {
+                    var ref3 = PemIdentifier.RefinePem(init3, u, y, maxIter: 15, tol: 1e-6);
+                    int n3 = ref3.Order;
+
+                    // Sanity check
+                    bool sane = true;
                     double dcG3;
                     try
                     {
@@ -2373,25 +2393,24 @@ namespace PIDAutoTuner
                         dcG3 = ref3.D;
                         for (int k = 0; k < n3; k++) dcG3 += ref3.C[0, k] * IAB3[k, 0];
                     }
-                    catch { dcG3 = double.NaN; }
+                    catch { dcG3 = double.NaN; sane = false; }
 
                     if (double.IsNaN(dcG3) || Math.Abs(dcG3) < 0.01 || Math.Abs(dcG3) > 100)
                         sane = false;
 
-                    var eig3 = ref3.A.Evd();
-                    for (int k = 0; k < n3; k++)
-                        if (eig3.EigenValues[k].Magnitude >= 0.99) { sane = false; break; }
-                }
-                if (sane) refined = ref3;
-            }
-            catch { /* n=3 실패 → n=2 시도 */ }
+                    if (sane)
+                    {
+                        var eig3 = ref3.A.Evd();
+                        for (int k = 0; k < n3; k++)
+                            if (eig3.EigenValues[k].Magnitude >= 0.99) { sane = false; break; }
+                    }
 
-            // n=3 실패/비정상 → n=2 폴백
-            if (refined == null)
-            {
-                var init2 = PemIdentifier.IdentifyPbsid(u, y, pastP, orderCap: 2);
-                refined = PemIdentifier.RefinePem(init2, u, y, maxIter: 15, tol: 1e-6);
+                    // n=3이 sanity 통과 + innovation cost가 n=2보다 낮으면 채택
+                    if (sane && ref3.InnovationRms < refined.InnovationRms * 0.9)
+                        refined = ref3;
+                }
             }
+            catch { /* n=3 실패 → n=2 유지 */ }
             int n = refined.Order;
             var A = refined.A;
             var B = refined.B;
@@ -2573,6 +2592,14 @@ namespace PIDAutoTuner
             double bestKp = Math.Round(Math.Max(0.001, Math.Min(1.0,   Math.Exp(globalBest[0]))), 3);
             double bestTi = Math.Round(Math.Max(0.1,   Math.Min(250.0, Math.Exp(globalBest[1]))), 1);
             double bestTd = Math.Round(Math.Max(0.0,   Math.Min(10.0,  Math.Exp(globalBest[2]))), 1);
+
+            // ── 경계값 감지: 3개 파라미터 모두 경계에 붙으면 모델이 시뮬에 부적합 ──
+            // Kp=0.001(하한), Ti=250(상한), Td≤0.1(하한 근접) → 식별 모델 reject
+            double boundaryEps = 0.05; // log 공간에서 경계 근접 판정
+            bool kpAtBound = Math.Abs(globalBest[0] - lo[0]) < boundaryEps;
+            bool tiAtBound = Math.Abs(globalBest[1] - hi[1]) < boundaryEps;
+            if (kpAtBound && tiAtBound)
+                throw new Exception("PEM PSO stuck at bounds (model likely unsuitable)");
 
             // 식별 신뢰도: innovation RMS / std(y). 0에 가까울수록 모델이 y를 잘 설명.
             double identRatio = (stdY > 1e-10) ? (refined.InnovationRms / stdY) : double.NaN;

@@ -158,7 +158,7 @@ namespace PIDAutoTuner
 
         /// <summary>Goertzel 알고리즘: 단일 주파수 DFT, O(N).</summary>
         /// <param name="omegaPerSample">2π·f·dt (rad/sample)</param>
-        private static Complex Goertzel(double[] x, double omegaPerSample, int N)
+        public static Complex Goertzel(double[] x, double omegaPerSample, int N)
         {
             double cosW = Math.Cos(omegaPerSample);
             double sinW = Math.Sin(omegaPerSample);

@@ -276,6 +276,7 @@ namespace PIDAutoTuner
             public int AdaptiveCount;            // 누적 횟수
             public int AdaptiveCheckInterval = 60; // 몇 샘플마다 체크 (약 1~1.5초)
             public int AdaptiveBoostCount;       // 진폭 증가 횟수
+            public double AdaptiveLastChangeT;   // 마지막 진폭 변경 시각 (chatter 방지 쿨다운)
             public double LastU;                 // 마지막 제어 출력 (포화 회피용)
             public double NaturalYStd;           // 가진 전 자연 변동 (y의 std)
 
@@ -319,6 +320,7 @@ namespace PIDAutoTuner
                 AdaptiveUSqSum = 0;
                 AdaptiveCount = 0;
                 AdaptiveBoostCount = 0;
+                AdaptiveLastChangeT = 0;
                 LastU = 0;
                 NaturalYStd = 0;
                 HasResult = false;
@@ -515,19 +517,24 @@ namespace PIDAutoTuner
                         bool yLow = yRatio < _s.AdaptiveSnrTarget;
                         bool uLow = uStd < U_INFO_THRESHOLD;
 
-                        // ── 양방향 적응 ──
+                        // ── 양방향 적응 (chatter 방지: 쿨다운 3초 + dead zone) ──
                         // 올림: 정보 부족 (y, u 둘 다 약함)
                         // 내림: 응답 과대 (u 포화 근접 또는 y 과응답)
                         const double U_SAT_NEAR = 0.7;     // u 포화 경계 (포화 = 0.98)
+                        const double U_SAT_DEAD_LO = 0.65; // dead zone 하한 (이 아래면 내림 안 함)
                         const double Y_OVER_RATIO = 1.5;   // yStd/amp 이 이 이상이면 과응답
+                        const double AMP_COOLDOWN = 3.0;   // 진폭 변경 후 최소 대기 시간 (초)
 
-                        if (yLow && uLow && amp < _s.AdaptiveAmpMax)
+                        bool cooledDown = (_sess.T - _sess.AdaptiveLastChangeT) >= AMP_COOLDOWN;
+
+                        if (cooledDown && yLow && uLow && amp < _s.AdaptiveAmpMax)
                         {
                             // 올림: amp × 2
                             double newAmp = Math.Min(amp * 2.0, _s.AdaptiveAmpMax);
                             _sess.AdaptiveCurrentAmp = newAmp;
                             _s.ExciteAmp = (float)newAmp;
                             _sess.AdaptiveBoostCount++;
+                            _sess.AdaptiveLastChangeT = _sess.T;
 
                             if (_sess.U.Count > 0)
                             {
@@ -537,12 +544,13 @@ namespace PIDAutoTuner
 
                             _sess.LastMessage = $"Adaptive ↑ amp {amp:0.00}→{newAmp:0.00} (yR={yRatio:0.00}, uStd={uStd:0.00} 둘 다 낮음)";
                         }
-                        else if (uStd > U_SAT_NEAR && amp > 0.05)
+                        else if (cooledDown && uStd > U_SAT_NEAR && amp > 0.05)
                         {
-                            // 내림: u 가 포화 근접 → 진폭 반감
+                            // 내림: u 가 포화 근접 → 진폭 반감 (dead zone: U_SAT_DEAD_LO ~ U_SAT_NEAR 유지)
                             double newAmp = Math.Max(0.05, amp * 0.5);
                             _sess.AdaptiveCurrentAmp = newAmp;
                             _s.ExciteAmp = (float)newAmp;
+                            _sess.AdaptiveLastChangeT = _sess.T;
 
                             if (_sess.U.Count > 0)
                             {
@@ -552,12 +560,13 @@ namespace PIDAutoTuner
 
                             _sess.LastMessage = $"Adaptive ↓ amp {amp:0.00}→{newAmp:0.00} (uStd={uStd:0.00} > {U_SAT_NEAR} 포화 근접)";
                         }
-                        else if (yRatio > Y_OVER_RATIO && amp > 0.05)
+                        else if (cooledDown && yRatio > Y_OVER_RATIO && amp > 0.05)
                         {
                             // 내림: y 과응답 (플랜트 게인 높음) → 진폭 반감
                             double newAmp = Math.Max(0.05, amp * 0.5);
                             _sess.AdaptiveCurrentAmp = newAmp;
                             _s.ExciteAmp = (float)newAmp;
+                            _sess.AdaptiveLastChangeT = _sess.T;
 
                             if (_sess.U.Count > 0)
                             {
@@ -1389,6 +1398,14 @@ namespace PIDAutoTuner
             double[] r = (_sess.R.Count >= blkStart + blkLen) ? new double[blkLen] : Array.Empty<double>();
             if (r.Length == blkLen) _sess.R.CopyTo(blkStart, r, 0, blkLen);
 
+            // fBase 하한 조정: 블록 길이에서 최소 2주기 관측 보장.
+            // fBase = 0.05Hz, 블록 = 10초 → 0.5주기만 관측 → BLA coherence 저하.
+            // fBase ≥ 2/T_block 으로 강제.
+            double T_block = blkLen * dt;
+            double fBaseLo = 2.0 / Math.Max(1.0, T_block);
+            if (_s.ExciteFreqHz < fBaseLo)
+                _s.ExciteFreqHz = (float)fBaseLo;
+
             // 데이터 품질 체크
             double satRatio = (double)_sess.SaturatedCount / Math.Max(1, _sess.SaturatedCount + _sess.U.Count);
             if (satRatio > 0.5)
@@ -1502,25 +1519,56 @@ namespace PIDAutoTuner
             _s.SettlingTimeTs = (float)bestTs;
             VrftResult vrft = bestResult;
 
-            // 3-way 식별: PEM / BLA / VRFT 모두 계산 후 신뢰도로 정렬.
-            //   PEM identRatio (innovation RMS / std(y)): 낮을수록 신뢰
-            //   BLA identRatio (1 - mean coherence): 낮을수록 신뢰 (coherence 높음)
-            //   VRFT: 항상 가능 (신뢰도 메트릭 없음, 폴백)
-            // 우선순위: 가장 낮은 IdentRatio 를 가진 모델이 주력, 차순위가 대안.
-            const double IDENT_THRESHOLD = 0.5; // 이보다 크면 신뢰 X (VRFT로 폴백)
+            // 3-way 식별 + 교차검증 RMSE 기반 선택.
+            //   이전: PEM=innovRms/stdY, BLA=1-γ² → 스케일 불일치 (시간/주파수 도메인 혼재).
+            //   개선: 데이터 80%로 식별, 20%로 교차검증 RMSE 계산 → 동일 단위 공정 비교.
+            //   교차검증 불가 시 (데이터 부족) 기존 방식 fallback.
+            const double IDENT_THRESHOLD = 0.5;
+
+            // ── 데이터 분할: 80% 식별 / 20% 교차검증 ──
+            int valLen = Math.Max(100, blkLen / 5);
+            bool canCrossVal = (blkLen - valLen) >= 200; // 식별 데이터 최소 200
+            int idLen = canCrossVal ? (blkLen - valLen) : blkLen;
+
+            double[] uId = canCrossVal ? new double[idLen] : u;
+            double[] yId = canCrossVal ? new double[idLen] : y;
+            double[] rId = null;
+            double[] uVal = null, yVal = null;
+            double stdYVal = 0;
+
+            if (canCrossVal)
+            {
+                Array.Copy(u, 0, uId, 0, idLen);
+                Array.Copy(y, 0, yId, 0, idLen);
+                if (r.Length == blkLen)
+                {
+                    rId = new double[idLen];
+                    Array.Copy(r, 0, rId, 0, idLen);
+                }
+                uVal = new double[valLen];
+                yVal = new double[valLen];
+                Array.Copy(u, idLen, uVal, 0, valLen);
+                Array.Copy(y, idLen, yVal, 0, valLen);
+                stdYVal = StdDev(yVal);
+                if (stdYVal < 1e-10) canCrossVal = false; // 검증 구간 변동 없으면 무의미
+            }
+            if (r.Length == blkLen && rId == null && canCrossVal)
+                rId = r; // fallback: 전체 r 사용 (cross-val 안 할 때)
 
             ModelPidResult pemResult = default;
             ModelPidResult blaResult = default;
             bool pemOk = false, blaOk = false;
             string pemInfo = "", blaInfo = "";
 
-            try { pemResult = ComputePemPid(u, y, dt); pemOk = true; pemInfo = pemResult.ModelInfo; }
+            try { pemResult = ComputePemPid(uId, yId, dt); pemOk = true; pemInfo = pemResult.ModelInfo; }
             catch (Exception ex) { pemInfo = $"PEM failed: {ex.Message}"; }
 
             // BLA 는 r 데이터 있을 때만
-            if (r.Length == blkLen)
+            double[] rForBla = canCrossVal ? rId : (r.Length == blkLen ? r : null);
+            if (rForBla != null && rForBla.Length >= idLen)
             {
-                try { blaResult = ComputeBlaPid(u, y, r, dt, _s); blaOk = true; blaInfo = blaResult.ModelInfo; }
+                double[] rBla = canCrossVal ? rId : r;
+                try { blaResult = ComputeBlaPid(uId, yId, rBla, dt, _s); blaOk = true; blaInfo = blaResult.ModelInfo; }
                 catch (Exception ex) { blaInfo = $"BLA failed: {ex.Message}"; }
             }
             else
@@ -1528,9 +1576,34 @@ namespace PIDAutoTuner
                 blaInfo = "BLA skipped: no excitation data";
             }
 
+            // ── 교차검증 RMSE 계산 (동일 스케일 비교) ──
+            if (canCrossVal && stdYVal > 1e-10)
+            {
+                if (pemOk && pemResult.PemModel != null)
+                {
+                    double pemCvRmse = PemCrossValRmse(pemResult.PemModel, uVal, yVal);
+                    if (!double.IsNaN(pemCvRmse))
+                    {
+                        pemResult.IdentRatio = pemCvRmse / stdYVal;
+                        pemInfo += $" cv={pemResult.IdentRatio:0.00}";
+                        pemResult.ModelInfo = pemInfo;
+                    }
+                }
+                if (blaOk && blaResult.BlaFrf != null)
+                {
+                    double blaCvRmse = BlaCrossValRmse(blaResult.BlaFrf, uVal, yVal, dt);
+                    if (!double.IsNaN(blaCvRmse))
+                    {
+                        blaResult.IdentRatio = blaCvRmse / stdYVal;
+                        blaInfo += $" cv={blaResult.IdentRatio:0.00}";
+                        blaResult.ModelInfo = blaInfo;
+                    }
+                }
+            }
+
             string vrftInfo = $"VRFT Ts={bestTs:0.00} rmse={vrft.Rmse:0.00e0}";
 
-            // 후보들 점수 매김: (이름, IdentRatio, Result, Info)
+            // 후보들 점수 매김: (이름, CrossValRMSE 정규화, Result, Info)
             var candidates = new List<(string name, double score, double Kp, double Ti, double Td, string info)>();
             if (pemOk && pemResult.IdentRatio < IDENT_THRESHOLD)
                 candidates.Add(("PEM", pemResult.IdentRatio, pemResult.Kp, pemResult.Ti, pemResult.Td, pemInfo));
@@ -1606,7 +1679,8 @@ namespace PIDAutoTuner
             foreach (var _ in _tabsByAxis) _sess.ValidateY.Add(new List<double>());
             _sess.ValidateStartT = 0;
             _autoState = AutoTuneState.Validating;
-            _sess.LastMessage = "Validating: collecting y on all axes for 5s... / 검증: 전 축 y 수집 중 (5초)...";
+            double valDur = GetValidateDuration();
+            _sess.LastMessage = $"Validating: collecting y on all axes for {valDur:0}s... / 검증: 전 축 y 수집 중 ({valDur:0}초)...";
         }
 
         private void OnValidateTick(double dt)
@@ -1626,8 +1700,10 @@ namespace PIDAutoTuner
                 idx++;
             }
 
-            // After 5 seconds, compute stats
-            if (_sess.ValidateStartT >= 5.0)
+            // 축별 검증 시간: 느린 축(Yaw/Hover/Forward) 15초, 빠른 축 5초
+            // Yaw 0.05Hz = 주기 20초 → 5초로는 1/4 주기만 관측. drift/oscillation 구분 불가.
+            double valDuration = GetValidateDuration();
+            if (_sess.ValidateStartT >= valDuration)
             {
                 var stdValues = new List<double>();
                 var axisNames = new List<string>();
@@ -1671,16 +1747,37 @@ namespace PIDAutoTuner
                     median = sorted[sorted.Count / 2];
                 }
 
-                // Build result message
+                // Build result message — 상대 기준 (중간값 2배) + 절대 기준 (std > 0.3) 이중 검사
+                // 상대만 쓰면 전축 나쁠 때 못 잡음. 절대 기준이 최후 안전망.
+                const double ABS_STD_THRESHOLD = 0.3;
                 var parts = new List<string>();
                 for (int i = 0; i < stdValues.Count; i++)
                 {
-                    string flag = (median > 1e-9 && stdValues[i] > 2.0 * median) ? " (HIGH)" : "";
+                    bool relativeHigh = median > 1e-9 && stdValues[i] > 2.0 * median;
+                    bool absoluteHigh = stdValues[i] > ABS_STD_THRESHOLD;
+                    string flag = relativeHigh ? " (HIGH)" : absoluteHigh ? " (HIGH-ABS)" : "";
                     parts.Add($"{axisNames[i]}: yStd={stdValues[i]:0.000}{flag}");
                 }
 
                 _autoState = AutoTuneState.Done;
                 _sess.LastMessage = "Validate: " + string.Join(", ", parts);
+            }
+        }
+
+        /// <summary>축 타입에 따른 검증 수집 시간. 느린 축은 최저 주파수 한 주기 이상 필요.</summary>
+        private double GetValidateDuration()
+        {
+            // 느린 축: Yaw(0.05Hz=20s주기), Hover, Forward, Strafe → 15초
+            // 빠른 축: Pitch, Roll → 5초
+            switch (_s.AxisKind)
+            {
+                case AxisType.Yaw:
+                case AxisType.Hover:
+                case AxisType.Forward:
+                case AxisType.Strafe:
+                    return 15.0;
+                default:
+                    return 5.0;
             }
         }
 
@@ -1742,6 +1839,18 @@ namespace PIDAutoTuner
             }
 
             double x = 0.0;
+
+            // ── Step prelude: 최초 0.5초 동안 일정 SP offset 유지 (DC 정보 주입) ──
+            // 멀티사인은 DC 성분 없음 → PEM/BLA 모두 DC gain 추정이 외삽.
+            // 0.5초 step 은 DC 방향 Fisher information 보강 → 세 방법 모두 DC 분산 감소.
+            const double STEP_PRELUDE_SEC = 0.5;
+            if (_s.ExciteWave == WaveType.MultiSine && _sess.T < STEP_PRELUDE_SEC)
+            {
+                x = amp; // 일정 양의 offset
+                _lastExciteValue = x;
+                try { this._focus.SetPointAdjust.Us = _baseSetPointAdjust + (float)x; } catch { }
+                return;
+            }
 
             switch (_s.ExciteWave)
             {
@@ -2147,7 +2256,75 @@ namespace PIDAutoTuner
         {
             public double Kp, Ti, Td;
             public string ModelInfo;
-            public double IdentRatio;  // innovation RMS / std(y) — 낮을수록 모델 신뢰 ↑ (PEM만)
+            public double IdentRatio;  // cross-validation RMSE / std(y) — 낮을수록 모델 신뢰 ↑
+            public PemIdentifier.Model PemModel;        // PEM 교차검증용 (null if BLA)
+            public BlaIdentifier.FrfEstimate BlaFrf;    // BLA 교차검증용 (null if PEM)
+        }
+
+        /// <summary>PEM 교차검증: innovation form one-step-ahead prediction on hold-out data.</summary>
+        private static double PemCrossValRmse(PemIdentifier.Model model, double[] uVal, double[] yVal)
+        {
+            int N = Math.Min(uVal.Length, yVal.Length);
+            if (N < 10) return double.NaN;
+            int n = model.Order;
+            double[] x = new double[n];
+            double sse = 0;
+            for (int k = 0; k < N; k++)
+            {
+                double yPred = model.D * uVal[k];
+                for (int i = 0; i < n; i++) yPred += model.C[0, i] * x[i];
+
+                double e = yVal[k] - yPred;
+                sse += e * e;
+
+                // state update: x(k+1) = A x(k) + B u(k) + K e(k)
+                double[] xNext = new double[n];
+                for (int i = 0; i < n; i++)
+                {
+                    double s = model.B[i, 0] * uVal[k] + model.K[i, 0] * e;
+                    for (int j = 0; j < n; j++) s += model.A[i, j] * x[j];
+                    xNext[i] = s;
+                }
+                x = xNext;
+            }
+            return Math.Sqrt(sse / N);
+        }
+
+        /// <summary>BLA 교차검증: FRF 기반 시간 도메인 재구성 RMSE on hold-out data.</summary>
+        private static double BlaCrossValRmse(BlaIdentifier.FrfEstimate frf, double[] uVal, double[] yVal, double dt)
+        {
+            int N = Math.Min(uVal.Length, yVal.Length);
+            if (N < 10) return double.NaN;
+            int K = frf.Freqs.Length;
+            const double COH_MIN = 0.3;
+
+            // 각 주파수 빈에서 U_k = Goertzel(u), Y_pred_k = G_k * U_k
+            // 시간 도메인 재구성: y_pred(t) = (2/N) Σ Re(Y_pred_k · e^{jω_k·t·dt})
+            double[] yPred = new double[N];
+            for (int k = 0; k < K; k++)
+            {
+                if (frf.Coherence[k] < COH_MIN) continue;
+                if (double.IsNaN(frf.G[k].Magnitude) || double.IsInfinity(frf.G[k].Magnitude)) continue;
+
+                double omegaPerSample = 2 * Math.PI * frf.Freqs[k] * dt;
+                var Uk = BlaIdentifier.Goertzel(uVal, omegaPerSample, N);
+                var Ypk = frf.G[k] * Uk;
+
+                double scale = 2.0 / N;
+                for (int t = 0; t < N; t++)
+                {
+                    double phase = omegaPerSample * t;
+                    yPred[t] += scale * (Ypk.Real * Math.Cos(phase) - Ypk.Imaginary * Math.Sin(phase));
+                }
+            }
+
+            double sse = 0;
+            for (int t = 0; t < N; t++)
+            {
+                double err = yVal[t] - yPred[t];
+                sse += err * err;
+            }
+            return Math.Sqrt(sse / N);
         }
         // ============================================================
         private static ModelPidResult ComputePemPid(double[] u, double[] y, double dt)
@@ -2170,12 +2347,51 @@ namespace PIDAutoTuner
             if (stdU < 1e-5) throw new Exception($"Excitation too weak (std(u)={stdU:0.0e})");
             if (stdY < 1e-5) throw new Exception($"Response too weak (std(y)={stdY:0.0e})");
 
-            // ── 1. PBSID-opt 초기 식별 ──
+            // ── 1. PBSID-opt 초기 식별 (n=3 조건부 허용) ──
+            // 이전: orderCap=2 하드캡 (n=4에서 dcGain=-13 등 overfitting).
+            // 개선: n=3까지 허용, sanity check 실패 시 n=2 폴백.
+            // Hover는 실질 3차(추력기 + 관성적분 + 감쇠), n=2 강제 시 정보 손실.
             int pastP = Math.Min(30, N / 8);
-            var initModel = PemIdentifier.IdentifyPbsid(u, y, pastP, orderCap: 2);
+            PemIdentifier.Model refined = null;
 
-            // ── 2. PEM 정련 (LM + finite-difference Jacobian) ──
-            var refined = PemIdentifier.RefinePem(initModel, u, y, maxIter: 15, tol: 1e-6);
+            // n=3 시도 (Gavish-Donoho가 n≥3 제안할 때만 실제로 n=3 사용)
+            try
+            {
+                var init3 = PemIdentifier.IdentifyPbsid(u, y, pastP, orderCap: 3);
+                var ref3 = PemIdentifier.RefinePem(init3, u, y, maxIter: 15, tol: 1e-6);
+
+                // Sanity check: |dcGain| ∈ [0.01, 100], 안정 (max|eig(A)| < 0.99)
+                bool sane = true;
+                int n3 = ref3.Order;
+                if (n3 >= 3)
+                {
+                    double dcG3;
+                    try
+                    {
+                        var IA3 = MB.DenseIdentity(n3) - ref3.A;
+                        var IAB3 = IA3.Solve(ref3.B);
+                        dcG3 = ref3.D;
+                        for (int k = 0; k < n3; k++) dcG3 += ref3.C[0, k] * IAB3[k, 0];
+                    }
+                    catch { dcG3 = double.NaN; }
+
+                    if (double.IsNaN(dcG3) || Math.Abs(dcG3) < 0.01 || Math.Abs(dcG3) > 100)
+                        sane = false;
+
+                    var eig3 = ref3.A.Evd();
+                    for (int k = 0; k < n3; k++)
+                        if (eig3.EigenValues[k].Magnitude >= 0.99) { sane = false; break; }
+                }
+                if (sane) refined = ref3;
+            }
+            catch { /* n=3 실패 → n=2 시도 */ }
+
+            // n=3 실패/비정상 → n=2 폴백
+            if (refined == null)
+            {
+                var init2 = PemIdentifier.IdentifyPbsid(u, y, pastP, orderCap: 2);
+                refined = PemIdentifier.RefinePem(init2, u, y, maxIter: 15, tol: 1e-6);
+            }
             int n = refined.Order;
             var A = refined.A;
             var B = refined.B;
@@ -2362,9 +2578,11 @@ namespace PIDAutoTuner
             double identRatio = (stdY > 1e-10) ? (refined.InnovationRms / stdY) : double.NaN;
 
             string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
-            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} ident={identRatio:0.00} cost={globalBestCost:0.000e0}";
+            string lowDcWarn = (!double.IsNaN(dcGain) && dcGain < 0.3)
+                ? " [⚠ low DC: Kp may hit limit / 저DC: Kp 한계 도달 가능]" : "";
+            string info = $"PEM n={n} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} ident={identRatio:0.00} cost={globalBestCost:0.000e0}{lowDcWarn}";
 
-            return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info, IdentRatio = identRatio };
+            return new ModelPidResult { Kp = bestKp, Ti = bestTi, Td = bestTd, ModelInfo = info, IdentRatio = identRatio, PemModel = refined };
         }
 
         // ============================================================
@@ -2518,13 +2736,14 @@ namespace PIDAutoTuner
             double bestTi = Math.Round(Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBestG[1]))), 1);
             double bestTd = Math.Round(Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBestG[2]))), 1);
 
-            // BLA 신뢰도: 평균 γ² (1=완전 선형 종속, 0=무상관). 1-γ² 를 IdentRatio 로 변환.
+            // BLA 신뢰도: 교차검증 RMSE 로 대체 (이전: 1-γ², PEM과 스케일 불일치 문제)
             string info = $"BLA seg={frf.NumSegments}×{frf.SegmentLength} bins={validBins}/{nComp} γ²={meanCoh:0.00} τM={tauM:0.00} cost={gBestCostG:0.000e0}";
             return new ModelPidResult
             {
                 Kp = bestKp, Ti = bestTi, Td = bestTd,
                 ModelInfo = info,
-                IdentRatio = 1.0 - meanCoh  // 낮을수록 신뢰 (γ² 높음)
+                IdentRatio = 1.0 - meanCoh,  // fallback (교차검증 데이터 부족 시)
+                BlaFrf = frf
             };
         }
 

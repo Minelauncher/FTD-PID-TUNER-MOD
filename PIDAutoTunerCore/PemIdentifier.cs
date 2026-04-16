@@ -204,7 +204,8 @@ namespace PIDAutoTuner
             double[] yd = (double[])y.Clone(); Detrend(yd);
 
             // ── Observer canonical form 시도 (n=2 전용) ──
-            // O = [C; C*A], det(O) > 1e-8 이면 축소 파라미터화 사용
+            // O = [C; C*A]. cond(O) < 1e3 이면 축소 파라미터화 사용.
+            // det 기반(1e-8)은 2×2에서 cond~1e4 허용 → 수치 오염. cond 직접 계산이 안전.
             if (n == 2)
             {
                 // Observability matrix O = [C; C*A] (2×2)
@@ -216,8 +217,12 @@ namespace PIDAutoTuner
                     for (int j = 0; j < 2; j++) s += init.C[0, j] * init.A[j, c];
                     O[1, c] = s;
                 }
+                // 2×2 SVD로 조건수 계산: cond = σ_max / σ_min
+                var svdO = O.Svd();
+                double s1 = svdO.S[0], s2 = svdO.S[1];
+                double condO = (s2 > 1e-15) ? (s1 / s2) : double.PositiveInfinity;
                 double detO = O[0, 0] * O[1, 1] - O[0, 1] * O[1, 0];
-                if (Math.Abs(detO) > 1e-8)
+                if (condO < 1e3)
                 {
                     // T = O, T^-1
                     var Tinv = MB.Dense(2, 2);

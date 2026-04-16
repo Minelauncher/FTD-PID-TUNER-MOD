@@ -499,25 +499,61 @@ namespace PIDAutoTuner
                         bool yLow = yRatio < _s.AdaptiveSnrTarget;
                         bool uLow = uStd < U_INFO_THRESHOLD;
 
+                        // ── 양방향 적응 ──
+                        // 올림: 정보 부족 (y, u 둘 다 약함)
+                        // 내림: 응답 과대 (u 포화 근접 또는 y 과응답)
+                        const double U_SAT_NEAR = 0.7;     // u 포화 경계 (포화 = 0.98)
+                        const double Y_OVER_RATIO = 1.5;   // yStd/amp 이 이 이상이면 과응답
+
                         if (yLow && uLow && amp < _s.AdaptiveAmpMax)
                         {
+                            // 올림: amp × 2
                             double newAmp = Math.Min(amp * 2.0, _s.AdaptiveAmpMax);
                             _sess.AdaptiveCurrentAmp = newAmp;
                             _s.ExciteAmp = (float)newAmp;
                             _sess.AdaptiveBoostCount++;
 
-                            // 진폭 변경 후 새 블록 시작 → 이전 약한 데이터와 분리
                             if (_sess.U.Count > 0)
                             {
                                 _sess.BlockStarts.Add(_sess.U.Count);
-                                _sess.BlockStartT = _sess.T; // chirp를 새 블록에서 처음부터 다시
+                                _sess.BlockStartT = _sess.T;
                             }
 
-                            _sess.LastMessage = $"Adaptive: amp {amp:0.00}→{newAmp:0.00} / 적응: 진폭 {amp:0.00}→{newAmp:0.00} (yStd/amp={yRatio:0.00}, uStd={uStd:0.00} 둘 다 낮음)";
+                            _sess.LastMessage = $"Adaptive ↑ amp {amp:0.00}→{newAmp:0.00} (yR={yRatio:0.00}, uStd={uStd:0.00} 둘 다 낮음)";
+                        }
+                        else if (uStd > U_SAT_NEAR && amp > 0.05)
+                        {
+                            // 내림: u 가 포화 근접 → 진폭 반감
+                            double newAmp = Math.Max(0.05, amp * 0.5);
+                            _sess.AdaptiveCurrentAmp = newAmp;
+                            _s.ExciteAmp = (float)newAmp;
+
+                            if (_sess.U.Count > 0)
+                            {
+                                _sess.BlockStarts.Add(_sess.U.Count);
+                                _sess.BlockStartT = _sess.T;
+                            }
+
+                            _sess.LastMessage = $"Adaptive ↓ amp {amp:0.00}→{newAmp:0.00} (uStd={uStd:0.00} > {U_SAT_NEAR} 포화 근접)";
+                        }
+                        else if (yRatio > Y_OVER_RATIO && amp > 0.05)
+                        {
+                            // 내림: y 과응답 (플랜트 게인 높음) → 진폭 반감
+                            double newAmp = Math.Max(0.05, amp * 0.5);
+                            _sess.AdaptiveCurrentAmp = newAmp;
+                            _s.ExciteAmp = (float)newAmp;
+
+                            if (_sess.U.Count > 0)
+                            {
+                                _sess.BlockStarts.Add(_sess.U.Count);
+                                _sess.BlockStartT = _sess.T;
+                            }
+
+                            _sess.LastMessage = $"Adaptive ↓ amp {amp:0.00}→{newAmp:0.00} (yStd/amp={yRatio:0.00} > {Y_OVER_RATIO} 과응답)";
                         }
                         else if (yLow && !uLow)
                         {
-                            _sess.LastMessage = $"Info OK (u active, uStd={uStd:0.00}) / 정보 충분: u 활발 (yStd/amp={yRatio:0.00})";
+                            _sess.LastMessage = $"Info OK (uStd={uStd:0.00}) / 정보 충분 (yR={yRatio:0.00})";
                         }
 
                         _sess.AdaptiveYSum = 0;

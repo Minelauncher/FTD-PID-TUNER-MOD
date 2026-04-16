@@ -2249,8 +2249,8 @@ namespace PIDAutoTuner
             const double w_pso = 0.7;
             const double c1 = 1.5;
             const double c2 = 1.5;
-            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
-            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0)  };
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.1)  };
+            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0) };
 
             var rng = new System.Random(42);
             double[][] pos = new double[nParticles][];
@@ -2438,8 +2438,8 @@ namespace PIDAutoTuner
             const double w_pso = 0.7;
             const double c1 = 1.5;
             const double c2 = 1.5;
-            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
-            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0)  };
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.1)  };
+            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0) };
 
             // 멀티시드 앙상블: 3개 독립 PSO 실행 → 최저 cost 선택
             // 단일 시드(42)는 재현성 좋지만 지역해에 갇힐 수 있음.
@@ -2603,8 +2603,8 @@ namespace PIDAutoTuner
             const double w_pso = 0.7;
             const double c1 = 1.5;
             const double c2 = 1.5;
-            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
-            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0)  };
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.1)  };
+            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0) };
 
             int[] seeds = { 42, 17, 83 };
             double[] gBestG = new double[3];

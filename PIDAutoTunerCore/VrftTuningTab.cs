@@ -2249,8 +2249,8 @@ namespace PIDAutoTuner
             const double w_pso = 0.7;
             const double c1 = 1.5;
             const double c2 = 1.5;
-            double[] lo = { Math.Log(0.0001), Math.Log(0.1),  Math.Log(0.0001) };
-            double[] hi = { Math.Log(2.0),    Math.Log(250.0), Math.Log(2.0)   };
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
+            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0)  };
 
             var rng = new System.Random(42);
             double[][] pos = new double[nParticles][];
@@ -2301,9 +2301,9 @@ namespace PIDAutoTuner
                 }
             }
 
-            double bestKp = Math.Max(0.0001, Math.Min(2.0,   Math.Exp(gBest[0])));
-            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBest[1])));
-            double bestTd = Math.Max(0.0,   Math.Min(100.0, Math.Exp(gBest[2])));
+            double bestKp = Math.Round(Math.Max(0.001, Math.Min(1.0,   Math.Exp(gBest[0]))), 3);   // FTD step 0.001
+            double bestTi = Math.Round(Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBest[1]))), 1);   // FTD step 0.1
+            double bestTd = Math.Round(Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBest[2]))), 1);   // FTD step 0.1
 
             string dcStr = double.IsNaN(dcGain) ? "int" : dcGain.ToString("0.00");
             string modelInfoStr = $"N4SID n={order} DC={dcStr} τp={dominantTau:0.00} D={D_sc:0.000} cost={gBestCost:0.000}";
@@ -2438,8 +2438,8 @@ namespace PIDAutoTuner
             const double w_pso = 0.7;
             const double c1 = 1.5;
             const double c2 = 1.5;
-            double[] lo = { Math.Log(0.0001), Math.Log(0.1),  Math.Log(0.0001) };
-            double[] hi = { Math.Log(2.0),    Math.Log(250.0), Math.Log(2.0)   };
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
+            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0)  };
 
             // 멀티시드 앙상블: 3개 독립 PSO 실행 → 최저 cost 선택
             // 단일 시드(42)는 재현성 좋지만 지역해에 갇힐 수 있음.
@@ -2509,9 +2509,9 @@ namespace PIDAutoTuner
             if (globalBestCost >= 1e100 || double.IsNaN(globalBestCost) || double.IsInfinity(globalBestCost))
                 throw new Exception("PEM PSO diverged (identified model unsuitable for sim)");
 
-            double bestKp = Math.Max(0.0001, Math.Min(2.0,   Math.Exp(globalBest[0])));
-            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(globalBest[1])));
-            double bestTd = Math.Max(0.0,   Math.Min(100.0, Math.Exp(globalBest[2])));
+            double bestKp = Math.Round(Math.Max(0.001, Math.Min(1.0,   Math.Exp(globalBest[0]))), 3);
+            double bestTi = Math.Round(Math.Max(0.1,   Math.Min(250.0, Math.Exp(globalBest[1]))), 1);
+            double bestTd = Math.Round(Math.Max(0.0,   Math.Min(10.0,  Math.Exp(globalBest[2]))), 1);
 
             // 식별 신뢰도: innovation RMS / std(y). 0에 가까울수록 모델이 y를 잘 설명.
             double identRatio = (stdY > 1e-10) ? (refined.InnovationRms / stdY) : double.NaN;
@@ -2603,8 +2603,8 @@ namespace PIDAutoTuner
             const double w_pso = 0.7;
             const double c1 = 1.5;
             const double c2 = 1.5;
-            double[] lo = { Math.Log(0.0001), Math.Log(0.1),  Math.Log(0.0001) };
-            double[] hi = { Math.Log(2.0),    Math.Log(250.0), Math.Log(2.0)   };
+            double[] lo = { Math.Log(0.001), Math.Log(0.1),  Math.Log(0.001) };
+            double[] hi = { Math.Log(1.0),   Math.Log(250.0), Math.Log(10.0)  };
 
             int[] seeds = { 42, 17, 83 };
             double[] gBestG = new double[3];
@@ -2669,9 +2669,9 @@ namespace PIDAutoTuner
             if (gBestCostG >= 1e100 || double.IsNaN(gBestCostG) || double.IsInfinity(gBestCostG))
                 throw new Exception("BLA PSO diverged");
 
-            double bestKp = Math.Max(0.0001, Math.Min(2.0,   Math.Exp(gBestG[0])));
-            double bestTi = Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBestG[1])));
-            double bestTd = Math.Max(0.0,   Math.Min(100.0, Math.Exp(gBestG[2])));
+            double bestKp = Math.Round(Math.Max(0.001, Math.Min(1.0,   Math.Exp(gBestG[0]))), 3);
+            double bestTi = Math.Round(Math.Max(0.1,   Math.Min(250.0, Math.Exp(gBestG[1]))), 1);
+            double bestTd = Math.Round(Math.Max(0.0,   Math.Min(10.0,  Math.Exp(gBestG[2]))), 1);
 
             // BLA 신뢰도: 평균 γ² (1=완전 선형 종속, 0=무상관). 1-γ² 를 IdentRatio 로 변환.
             string info = $"BLA seg={frf.NumSegments}×{frf.SegmentLength} bins={validBins}/{nComp} γ²={meanCoh:0.00} τM={tauM:0.00} cost={gBestCostG:0.000e0}";

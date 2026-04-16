@@ -1049,9 +1049,23 @@ namespace PIDAutoTuner
                 }
                 catch { }
 
-                // 다른 축 SP 캡처 (현재 축 제외)
+                // 다른 축 SP 고정 (현재 축 제외)
+                // FakeSetPoint = 현재 PV → FakeSetPointInUse = true → AI SP 덮어쓰기
+                // 이전: SetPointAdjust freeze → AI가 자체 SP 계속 업데이트라 효과 없음.
+                // 개선: FakeSetPoint 로 AI SP를 현재 PV 값으로 고정.
                 if (axis == this._focus) continue;
-                try { _frozenOtherSPs[axis] = axis.SetPointAdjust.Us; }
+                try
+                {
+                    var ctrl = axis.GetCurrentController();
+                    if (ctrl != null)
+                    {
+                        float currentPV = ctrl.LastProcessVariable;
+                        // 기존 FakeSetPoint 상태 백업 (복원용)
+                        _frozenOtherSPs[axis] = (bool)axis.FakeSetPointInUse ? (float)axis.FakeSetPoint : float.NaN;
+                        axis.FakeSetPoint.Us = currentPV;
+                        axis.FakeSetPointInUse.Us = true;
+                    }
+                }
                 catch { }
             }
 
@@ -1080,15 +1094,11 @@ namespace PIDAutoTuner
         /// </summary>
         private void ApplyOtherAxesFixture()
         {
-            // 1. 일반 freeze (피치는 제외 — 아래에서 특수 처리)
-            foreach (var kv in _frozenOtherSPs)
-            {
-                if (_altHoldActive && kv.Key == _pitchTargetAxis) continue;  // 피치는 별도
-                try { kv.Key.SetPointAdjust.Us = kv.Value; }
-                catch { }
-            }
+            // FakeSetPoint 방식: Capture 에서 이미 FakeSetPointInUse=true 설정.
+            // FakeSetPoint 는 FTD 내부에서 유지되므로 매 틱 재적용 불필요.
+            // 피치 고도 유지만 매 틱 업데이트 필요.
 
-            // 2. 피치 고도 유지 — Hover PV 로 고도 오차 → 피치 SP offset
+            // 피치 고도 유지 — Hover PV 로 고도 오차 → 피치 FakeSetPoint 실시간 조정
             if (!_altHoldActive || _pitchTargetAxis == null || _altitudeSourceAxis == null) return;
             try
             {
@@ -1101,22 +1111,44 @@ namespace PIDAutoTuner
 
                 if (_pitchTargetAxis == this._focus)
                 {
-                    // 피치가 튜닝 대상: excitation 위에 offset 더함
-                    // ApplyExcitation 가 이미 SP = base + excitation 설정. offset 을 SP 에 더함.
-                    _pitchTargetAxis.SetPointAdjust.Us += (float)offset;
+                    // 피치가 튜닝 대상: excitation 위에 offset 더함 (SetPointAdjust 로)
+                    _pitchTargetAxis.SetPointAdjust.Us = _baseSetPointAdjust + (float)_lastExciteValue + (float)offset;
                 }
                 else
                 {
-                    // 피치 고정 (다른 축 튜닝 중): freeze 값 대신 offset 직접 설정
-                    _pitchTargetAxis.SetPointAdjust.Us = (float)offset;
+                    // 피치 고정 (다른 축 튜닝 중): FakeSetPoint 에 고도 보정 offset 반영
+                    var pitchCtrl = _pitchTargetAxis.GetCurrentController();
+                    if (pitchCtrl != null)
+                    {
+                        float basePitch = pitchCtrl.LastProcessVariable;
+                        _pitchTargetAxis.FakeSetPoint.Us = basePitch + (float)offset;
+                    }
                 }
             }
             catch { }
         }
 
-        /// <summary>튜닝 종료 시. freeze 해제 — 다른 축 SP 가 다시 AI 에 의해 제어됨.</summary>
+        /// <summary>튜닝 종료 시. FakeSetPoint 해제 — 다른 축 SP 가 다시 AI 에 의해 제어됨.</summary>
         private void ReleaseOtherAxesFixture()
         {
+            // FakeSetPointInUse 를 원복 (이전 상태로)
+            foreach (var kv in _frozenOtherSPs)
+            {
+                try
+                {
+                    if (float.IsNaN(kv.Value))
+                    {
+                        // 이전에 FakeSetPoint 미사용 → 해제
+                        kv.Key.FakeSetPointInUse.Us = false;
+                    }
+                    else
+                    {
+                        // 이전에 FakeSetPoint 사용 중이었음 → 원래 값 복원
+                        kv.Key.FakeSetPoint.Us = kv.Value;
+                    }
+                }
+                catch { }
+            }
             _frozenOtherSPs.Clear();
             _altHoldActive = false;
             _altitudeSourceAxis = null;

@@ -1613,10 +1613,19 @@ namespace PIDAutoTuner
             catch (Exception ex) { pemInfo = $"PEM failed: {ex.Message}"; }
 
             // BLA 는 r 데이터 있을 때만
-            double[] rForBla = canCrossVal ? rId : (r.Length == blkLen ? r : null);
-            if (rForBla != null && rForBla.Length >= idLen)
+            // r 배열은 원본 블록 기준으로 추출됨. 교차검증 시 식별 부분만 사용.
+            if (r.Length > 0)
             {
-                double[] rBla = canCrossVal ? rId : r;
+                double[] rBla;
+                if (canCrossVal)
+                {
+                    rBla = new double[idLen];
+                    Array.Copy(r, 0, rBla, 0, Math.Min(r.Length, idLen));
+                }
+                else
+                {
+                    rBla = r;
+                }
                 try { blaResult = ComputeBlaPid(uId, yId, rBla, dt, _s); blaOk = true; blaInfo = blaResult.ModelInfo; }
                 catch (Exception ex) { blaInfo = $"BLA failed: {ex.Message}"; }
             }
@@ -1690,7 +1699,13 @@ namespace PIDAutoTuner
 
             _autoState = AutoTuneState.Done;
             string swapHint = hasAlt ? $" | alt {altName}: Kp={altKp:0.000} Ti={altTi:0.1} Td={altTd:0.00}" : "";
-            _sess.LastMessage = $"Done | {primaryName}: Kp={primaryKp:0.000} Ti={primaryTi:0.1} Td={primaryTd:0.00}{swapHint}";
+            // 진단: PEM/BLA 탈락 이유 표시
+            string diagParts = "";
+            if (!pemOk) diagParts += $" [{pemInfo}]";
+            else if (pemResult.IdentRatio >= IDENT_THRESHOLD) diagParts += $" [PEM cv={pemResult.IdentRatio:0.00}>thr]";
+            if (!blaOk) diagParts += $" [{blaInfo}]";
+            else if (blaResult.IdentRatio >= IDENT_THRESHOLD) diagParts += $" [BLA cv={blaResult.IdentRatio:0.00}>thr]";
+            _sess.LastMessage = $"Done | {primaryName}: Kp={primaryKp:0.000} Ti={primaryTi:0.1} Td={primaryTd:0.00}{swapHint}{diagParts}";
         }
 
         /// <summary>주 결과와 대안 결과를 swap (사용자가 다른 방법 결과를 보고 싶을 때).</summary>
